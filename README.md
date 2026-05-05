@@ -12,7 +12,7 @@ license: mit
 
 <div align="center">
 
-# 🧠 SVM Explorer
+# 🧠 ML Explorer
 
 **An interactive tool for learning, visualizing, and experimenting with Support Vector Machines**
 
