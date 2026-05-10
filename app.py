@@ -221,7 +221,7 @@ with st.sidebar:
         "Algorithm",
         ["⚡ SVM", "📈 Regression", "🌳 Decision Tree / RF",
          "🔵 K-Means Clustering", "👥 KNN", "🧠 Neural Network (MLP)",
-         "🔁 AutoEncoder"],
+         "🔁 AutoEncoder", "🎲 VAE (Variational)"],
         label_visibility="collapsed"
     )
     st.markdown("---")
@@ -950,13 +950,22 @@ elif algo == "🔁 AutoEncoder":
 
     with st.sidebar:
         st.markdown("### AutoEncoder Settings")
-        latent_dim  = st.slider("Latent Dimension", 1, 16, 2, 1,
-                                 help="Size of the bottleneck — smaller = more compression")
+
+        st.markdown('<div style="color:#8892b0;font-size:0.75rem;margin-bottom:4px;">🗜️ <b>Latent Dimension</b> — the bottleneck size.<br>Smaller = more compression, harder to reconstruct. Larger = easier but less interesting.</div>', unsafe_allow_html=True)
+        latent_dim  = st.slider("Latent Dimension", 1, 16, 2, 1)
+
+        st.markdown('<div style="color:#8892b0;font-size:0.75rem;margin:6px 0 4px;">🧱 <b>Hidden Layer Size</b> — neurons in encoder/decoder layers.<br>More neurons = more capacity to learn complex patterns.</div>', unsafe_allow_html=True)
         hidden_size = st.slider("Hidden Layer Size", 8, 128, 32, 8)
-        noise_level = st.slider("Input Noise (Denoising)", 0.0, 1.0, 0.0, 0.05,
-                                 help="Add noise to input — train as Denoising AE")
+
+        st.markdown('<div style="color:#8892b0;font-size:0.75rem;margin:6px 0 4px;">🔊 <b>Input Noise</b> — adds random noise to the input.<br>0 = normal AE. >0 = Denoising AE (must reconstruct clean signal from noisy input).</div>', unsafe_allow_html=True)
+        noise_level = st.slider("Input Noise (Denoising)", 0.0, 1.0, 0.0, 0.05)
+
+        st.markdown('<div style="color:#8892b0;font-size:0.75rem;margin:6px 0 4px;">🔄 <b>Epochs</b> — how many full passes through the data.<br>More = better learning, but slower. Stop when loss flattens.</div>', unsafe_allow_html=True)
         n_epochs    = st.slider("Epochs", 50, 500, 200, 50)
+
+        st.markdown('<div style="color:#8892b0;font-size:0.75rem;margin:6px 0 4px;">⚡ <b>Learning Rate</b> — how big each weight update step is.<br>Too high = unstable. Too low = very slow. 0.01 is a safe default.</div>', unsafe_allow_html=True)
         lr_ae       = st.select_slider("Learning Rate", [0.0001,0.001,0.01,0.1], value=0.01)
+
         st.markdown("---")
         st.markdown("### Data")
         ae_dataset  = st.selectbox("Dataset", ["Digits (MNIST-like)", "Iris", "Blobs"])
@@ -1272,7 +1281,442 @@ elif algo == "🔁 AutoEncoder":
             st.pyplot(fig); plt.close()
             st.info("💡 Increase Latent Dim to 2+ to see a 2D scatter plot of the latent space.")
 
-# ── Footer ───────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+# ██  VAE — Variational AutoEncoder
+# ══════════════════════════════════════════════════════════════
+elif algo == "🎲 VAE (Variational)":
+    st.markdown('<div class="main-header"><h1>🎲 Variational AutoEncoder (VAE)</h1><p>Learn a smooth, structured latent space — and generate brand-new data</p></div>', unsafe_allow_html=True)
+
+    with st.sidebar:
+        st.markdown("### VAE Settings")
+
+        st.markdown('<div style="color:#8892b0;font-size:0.75rem;margin-bottom:4px;">🗜️ <b>Latent Dimension</b> — size of the learned distribution.<br>2D is perfect for visualization. Higher = more expressive but harder to visualize.</div>', unsafe_allow_html=True)
+        vae_latent = st.slider("Latent Dimension", 1, 8, 2, 1, key="vae_lat")
+
+        st.markdown('<div style="color:#8892b0;font-size:0.75rem;margin:6px 0 4px;">🧱 <b>Hidden Size</b> — neurons in encoder/decoder hidden layers.<br>Larger = model can learn richer patterns, but risks overfitting small datasets.</div>', unsafe_allow_html=True)
+        vae_hidden = st.slider("Hidden Size", 8, 128, 32, 8, key="vae_hid")
+
+        st.markdown('<div style="color:#8892b0;font-size:0.75rem;margin:6px 0 4px;">⚖️ <b>Beta (KL weight)</b> — balances reconstruction vs. regularity.<br>β=1 is standard VAE. Higher β = smoother/more disentangled latent space, but worse reconstruction. Lower β = sharper outputs but messier latent space.</div>', unsafe_allow_html=True)
+        vae_beta   = st.slider("Beta (KL weight) β", 0.0, 5.0, 1.0, 0.1, key="vae_beta")
+
+        st.markdown('<div style="color:#8892b0;font-size:0.75rem;margin:6px 0 4px;">🔄 <b>Epochs</b> — training passes through all data.<br>Watch the loss curve — stop when it flattens. More data needs more epochs.</div>', unsafe_allow_html=True)
+        vae_epochs = st.slider("Epochs", 50, 600, 250, 50, key="vae_ep")
+
+        st.markdown('<div style="color:#8892b0;font-size:0.75rem;margin:6px 0 4px;">⚡ <b>Learning Rate</b> — gradient step size.<br>0.001–0.01 works best for VAEs. Too high → NaN loss. Too low → very slow convergence.</div>', unsafe_allow_html=True)
+        vae_lr     = st.select_slider("Learning Rate", [0.0001,0.001,0.005,0.01,0.05], value=0.005, key="vae_lr")
+
+        st.markdown("---")
+        st.markdown("### Data")
+        vae_ds = st.selectbox("Dataset", ["Digits (MNIST-like)", "Iris", "Blobs"], key="vae_ds")
+
+    # ── Data ──────────────────────────────────────────────────
+    @st.cache_data
+    def get_vae_data(name):
+        if name == "Digits (MNIST-like)":
+            d = datasets.load_digits()
+            X = d.data.astype(np.float32) / 16.0
+            y = d.target
+        elif name == "Iris":
+            d = datasets.load_iris()
+            X = d.data.astype(np.float32); y = d.target
+        else:
+            X, y = datasets.make_blobs(300, n_features=4, centers=3, random_state=42)
+            X = X.astype(np.float32)
+        sc = StandardScaler()
+        X = sc.fit_transform(X).astype(np.float32)
+        return X, y
+
+    # ── Pure-numpy VAE ────────────────────────────────────────
+    def relu(x):    return np.maximum(0, x)
+    def relu_d(x):  return (x > 0).astype(float)
+
+    @st.cache_data
+    def train_vae(X, latent_dim, hidden, beta, epochs, lr):
+        np.random.seed(42)
+        n = X.shape[1]
+        # Encoder weights → μ and log σ²
+        We1 = np.random.randn(n,      hidden)     * np.sqrt(2/n)
+        be1 = np.zeros((1, hidden))
+        Wmu = np.random.randn(hidden, latent_dim) * 0.01
+        bmu = np.zeros((1, latent_dim))
+        Wlv = np.random.randn(hidden, latent_dim) * 0.01
+        blv = np.zeros((1, latent_dim))
+        # Decoder weights
+        Wd1 = np.random.randn(latent_dim, hidden) * np.sqrt(2/latent_dim)
+        bd1 = np.zeros((1, hidden))
+        Wo  = np.random.randn(hidden, n)           * 0.01
+        bo  = np.zeros((1, n))
+
+        losses, recon_losses, kl_losses = [], [], []
+        batch = min(64, len(X))
+
+        for epoch in range(epochs):
+            idx = np.random.permutation(len(X))
+            ep_loss = ep_recon = ep_kl = 0
+            for i in range(0, len(X), batch):
+                Xb = X[idx[i:i+batch]]
+                B  = len(Xb)
+
+                # ── Encode ──
+                h1  = relu(Xb @ We1 + be1)         # (B, hidden)
+                mu  = h1 @ Wmu + bmu               # (B, latent)
+                lv  = np.clip(h1 @ Wlv + blv, -4, 4)  # log variance
+                std = np.exp(0.5 * lv)
+                eps = np.random.randn(B, latent_dim)
+                z   = mu + std * eps               # reparameterization
+
+                # ── Decode ──
+                h2  = relu(z @ Wd1 + bd1)
+                xr  = h2 @ Wo + bo                 # reconstruction
+
+                # ── Loss ──
+                recon = np.mean((xr - Xb)**2)
+                kl    = -0.5 * np.mean(1 + lv - mu**2 - np.exp(lv))
+                loss  = recon + beta * kl
+                ep_loss += loss; ep_recon += recon; ep_kl += kl
+
+                # ── Backprop decoder ──
+                dxr  = 2*(xr - Xb) / (B * n)
+                dWo  = h2.T @ dxr;          dbo  = dxr.sum(0, keepdims=True)
+                dh2  = dxr @ Wo.T * relu_d(z @ Wd1 + bd1)
+                dWd1 = z.T @ dh2;           dbd1 = dh2.sum(0, keepdims=True)
+                dz   = dh2 @ Wd1.T
+
+                # ── Backprop reparameterization ──
+                dmu_recon = dz.copy()
+                dlv_recon = dz * eps * 0.5 * std
+
+                # ── KL gradients ──
+                dmu_kl = beta * mu / (B * latent_dim)
+                dlv_kl = beta * 0.5 * (np.exp(lv) - 1) / (B * latent_dim)
+
+                dmu = dmu_recon + dmu_kl
+                dlv = np.clip(dlv_recon + dlv_kl, -1, 1)
+
+                # ── Backprop encoder ──
+                dh1_mu  = dmu @ Wmu.T * relu_d(Xb @ We1 + be1)
+                dh1_lv  = dlv @ Wlv.T * relu_d(Xb @ We1 + be1)
+                dh1     = dh1_mu + dh1_lv
+
+                dWmu = np.clip(h1.T @ dmu,  -1, 1); dbmu = np.clip(dmu.sum(0, keepdims=True),  -1, 1)
+                dWlv = np.clip(h1.T @ dlv,  -1, 1); dblv = np.clip(dlv.sum(0, keepdims=True),  -1, 1)
+                dWe1 = np.clip(Xb.T @ dh1,  -1, 1); dbe1 = np.clip(dh1.sum(0, keepdims=True),  -1, 1)
+
+                We1-=lr*dWe1; be1-=lr*dbe1
+                Wmu-=lr*dWmu; bmu-=lr*dbmu
+                Wlv-=lr*dWlv; blv-=lr*dblv
+                Wd1-=lr*dWd1; bd1-=lr*dbd1
+                Wo -=lr*dWo;  bo -=lr*dbo
+
+            losses.append(ep_loss)
+            recon_losses.append(ep_recon)
+            kl_losses.append(ep_kl)
+
+        return (We1,be1,Wmu,bmu,Wlv,blv,Wd1,bd1,Wo,bo), losses, recon_losses, kl_losses
+
+    def vae_encode(X, We1,be1,Wmu,bmu,Wlv,blv):
+        h1  = relu(X @ We1 + be1)
+        mu  = h1 @ Wmu + bmu
+        lv  = np.clip(h1 @ Wlv + blv, -4, 4)
+        return mu, lv
+
+    def vae_decode(z, Wd1,bd1,Wo,bo):
+        h2  = relu(z @ Wd1 + bd1)
+        return h2 @ Wo + bo
+
+    X_vae, y_vae = get_vae_data(vae_ds)
+
+    with st.spinner("Training VAE... (pure numpy, no PyTorch needed)"):
+        vae_w, losses_total, losses_recon, losses_kl = train_vae(
+            X_vae, vae_latent, vae_hidden, vae_beta, vae_epochs, vae_lr
+        )
+
+    We1,be1,Wmu,bmu,Wlv,blv,Wd1,bd1,Wo,bo = vae_w
+    mu_all, lv_all = vae_encode(X_vae, We1,be1,Wmu,bmu,Wlv,blv)
+    recon_all = vae_decode(mu_all, Wd1,bd1,Wo,bo)
+    recon_loss_final = np.mean((recon_all - X_vae)**2)
+    kl_final         = -0.5 * np.mean(1 + lv_all - mu_all**2 - np.exp(lv_all))
+
+    # ── TABS ──────────────────────────────────────────────────
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "📖 VAE vs AE", "📉 Training Curves", "🎲 Generate Samples", "🗺️ Latent Space"
+    ])
+
+    # ── TAB 1: Concept ────────────────────────────────────────
+    with tab1:
+        c1, c2 = st.columns([1,1])
+        with c1:
+            st.markdown("""
+<div class="card"><h3>🤔 What's Wrong with a Regular AutoEncoder?</h3>
+<p>A regular AE learns a latent space, but it can be <strong>messy and full of holes</strong>. If you pick a random point in the latent space and decode it, you often get garbage — because the AE never learned what should live between the clusters.</p>
+<div class="highlight">💡 Regular AE: compress → reconstruct. That's it. No structure in the latent space.</div></div>
+
+<div class="card"><h3>🎲 The VAE Idea: Learn a Distribution, Not a Point</h3>
+<p>Instead of encoding each input to a single point, a VAE encodes it to a <strong>probability distribution</strong> (a Gaussian bell curve) — described by two values:</p>
+<ul>
+<li><strong>μ (mu)</strong>: the mean — "where the point should be"</li>
+<li><strong>σ (sigma)</strong>: the spread — "how uncertain we are"</li></ul>
+<p>Then we sample from that distribution. This forces the latent space to be <strong>smooth and continuous</strong> — every point in it means something!</p>
+<div class="highlight">💡 VAE: compress → distribution → sample → reconstruct. The randomness forces structure.</div></div>
+
+<div class="card"><h3>🔀 The Reparameterization Trick</h3>
+<p>Sampling is random, so how do we backpropagate through it? Simple trick: instead of sampling z directly, compute <strong>z = μ + σ × ε</strong> where ε is random noise drawn once.</p>
+<p>Now gradients can flow through μ and σ, while ε is just a fixed constant for that step.</p>
+<div class="highlight">💡 This is the key innovation that makes VAEs trainable!</div></div>
+
+<div class="card"><h3>⚖️ The VAE Loss: Two Terms Fighting Each Other</h3>
+<p><strong>Total Loss = Reconstruction Loss + β × KL Divergence</strong></p>
+<ul>
+<li><strong>Reconstruction Loss</strong>: "make your output look like your input" — same as AE</li>
+<li><strong>KL Divergence</strong>: "keep your distributions close to a standard Gaussian" — forces regularity</li>
+<li><strong>β (Beta)</strong>: how much you care about the KL term vs reconstruction</li></ul>
+<p>These two terms are in tension — reconstruction wants freedom, KL wants order. The balance creates a useful latent space.</p>
+<div class="highlight">💡 High β → very organized latent space but blurry outputs. Low β → sharp outputs but messy latent space.</div></div>
+
+<div class="card"><h3>🆚 AE vs VAE — Quick Comparison</h3>
+<table style="width:100%;font-size:0.85rem;color:#a8b2d8;border-collapse:collapse;">
+<tr><th style="color:#4fc3f7;text-align:left;padding:4px;">Feature</th><th style="color:#4fc3f7;text-align:left;padding:4px;">AutoEncoder</th><th style="color:#4fc3f7;text-align:left;padding:4px;">VAE</th></tr>
+<tr><td style="padding:4px;">Latent</td><td style="padding:4px;">Fixed point</td><td style="padding:4px;">Distribution (μ, σ)</td></tr>
+<tr><td style="padding:4px;">Can Generate?</td><td style="padding:4px;">❌ No (gaps are noise)</td><td style="padding:4px;">✅ Yes (smooth space)</td></tr>
+<tr><td style="padding:4px;">Latent Space</td><td style="padding:4px;">Unstructured</td><td style="padding:4px;">Smooth & continuous</td></tr>
+<tr><td style="padding:4px;">Loss</td><td style="padding:4px;">Reconstruction only</td><td style="padding:4px;">Recon + KL</td></tr>
+<tr><td style="padding:4px;">Best for</td><td style="padding:4px;">Compression, denoising</td><td style="padding:4px;">Generation, interpolation</td></tr>
+</table></div>
+""", unsafe_allow_html=True)
+
+        with c2:
+            # Architecture diagram VAE
+            fig, ax = plt.subplots(figsize=(8,5.5))
+            fig.patch.set_facecolor('#0a0f1e'); ax.set_facecolor('#0a0f1e'); ax.axis('off')
+            n_in = X_vae.shape[1]
+            # Draw blocks instead of circles for clarity
+            sections = [
+                (0.05, 0.22, '#1e3a5f',  '#4fc3f7', f'Encoder\n({min(n_in,8)}→{vae_hidden})'),
+                (0.27, 0.44, '#0d2137',  '#ab47bc', f'μ  &  log σ²\n(dim={vae_latent})'),
+                (0.50, 0.50, '#0a0f1e',  '#00e5ff', 'Sample\nz = μ+σε'),
+                (0.56, 0.73, '#1e3a5f',  '#4fc3f7', f'Decoder\n({vae_latent}→{vae_hidden})'),
+                (0.78, 0.95, '#0d2137',  '#4fc3f7', f'Output\n(dim={min(n_in,8)})'),
+            ]
+            for x0, x1, fc, ec, label in sections:
+                rect = plt.Rectangle((x0, 0.3), x1-x0, 0.4, fc=fc, ec=ec, lw=1.5, zorder=3)
+                ax.add_patch(rect)
+                ax.text((x0+x1)/2, 0.5, label, ha='center', va='center',
+                        color='white', fontsize=8.5, fontfamily='monospace', fontweight='bold', zorder=5)
+
+            # Arrows between sections
+            for xs, xe, col in [(0.22,0.27,'#4fc3f7'),(0.44,0.5,'#ab47bc'),
+                                  (0.5,0.56,'#00e5ff'),(0.73,0.78,'#4fc3f7')]:
+                ax.annotate('', xy=(xe, 0.5), xytext=(xs, 0.5),
+                            arrowprops=dict(arrowstyle='->', color=col, lw=2), zorder=6)
+
+            # Labels above/below
+            ax.text(0.35, 0.78, 'Bottleneck\n(Distribution)', ha='center', color='#ab47bc',
+                    fontsize=8, fontfamily='monospace')
+            ax.text(0.5, 0.16, 'ε ~ N(0,1)', ha='center', color='#00e5ff',
+                    fontsize=8.5, fontfamily='monospace')
+            ax.text(0.05, 0.82, 'Input x', ha='left', color='#8892b0', fontsize=8, fontfamily='monospace')
+            ax.text(0.82, 0.82, 'x̂ ≈ x', ha='left', color='#8892b0', fontsize=8, fontfamily='monospace')
+            ax.set_xlim(0,1); ax.set_ylim(0,1)
+            ax.set_title('VAE Architecture', color='#4fc3f7', fontsize=12, fontweight='bold')
+            st.pyplot(fig); plt.close()
+
+            # Show loss formula
+            st.markdown(f"""
+<div class="card" style="margin-top:1rem;">
+<h3>📐 Current Loss Breakdown</h3>
+<table style="width:100%;font-size:0.9rem;color:#a8b2d8;">
+<tr><td>🔵 Reconstruction Loss</td><td style="color:#4fc3f7;font-family:monospace;">{losses_recon[-1]:.4f}</td></tr>
+<tr><td>🟣 KL Divergence × β={vae_beta}</td><td style="color:#ab47bc;font-family:monospace;">{vae_beta * losses_kl[-1]:.4f}</td></tr>
+<tr><td><b>Total Loss</b></td><td style="color:#00e5ff;font-family:monospace;"><b>{losses_total[-1]:.4f}</b></td></tr>
+</table>
+</div>
+""", unsafe_allow_html=True)
+
+    # ── TAB 2: Training Curves ────────────────────────────────
+    with tab2:
+        m1,m2,m3,m4 = st.columns(4)
+        for col,lbl,val in zip([m1,m2,m3,m4],
+            ["📉 Final Loss","🔵 Recon Loss","🟣 KL Loss","🗜️ Latent Dim"],
+            [f"{losses_total[-1]:.4f}", f"{recon_loss_final:.4f}", f"{kl_final:.4f}", str(vae_latent)]):
+            with col: st.markdown(metric_box(val,lbl), unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        fig, axes = plt.subplots(1, 3, figsize=(13, 4))
+        fig.patch.set_facecolor('#0a0f1e')
+        for ax in axes: style_ax(ax)
+
+        axes[0].plot(losses_total,  color='#00e5ff', lw=2, label='Total')
+        axes[0].set_title("Total Loss",       color='#4fc3f7', fontsize=11, fontweight='bold')
+        axes[0].set_xlabel("Epoch", color='#8892b0')
+
+        axes[1].plot(losses_recon,  color='#4fc3f7', lw=2)
+        axes[1].set_title("Reconstruction Loss", color='#4fc3f7', fontsize=11, fontweight='bold')
+        axes[1].set_xlabel("Epoch", color='#8892b0')
+
+        axes[2].plot(losses_kl,     color='#ab47bc', lw=2)
+        axes[2].set_title("KL Divergence",    color='#4fc3f7', fontsize=11, fontweight='bold')
+        axes[2].set_xlabel("Epoch", color='#8892b0')
+
+        plt.tight_layout(); st.pyplot(fig); plt.close()
+
+        st.markdown("""
+<div class="card">
+<h3>📖 How to Read These Curves</h3>
+<ul>
+<li><strong>Total Loss</strong> should steadily decrease and flatten — if it's still falling sharply, train more epochs</li>
+<li><strong>Reconstruction Loss</strong> going down = the decoder is getting better at rebuilding inputs</li>
+<li><strong>KL Divergence</strong> going up slightly then stabilizing is normal — it means the latent space is being regularized</li>
+<li>If KL collapses to 0 → the model ignores the latent space (KL collapse) → try lowering β or increasing latent dim</li>
+</ul>
+</div>
+""", unsafe_allow_html=True)
+
+    # ── TAB 3: Generation ────────────────────────────────────
+    with tab3:
+        st.markdown("### 🎲 Generate New Samples from the Latent Space")
+        st.markdown("""
+<div class="card">
+<h3>💡 How Generation Works</h3>
+<p>Because the VAE forces the latent space to follow a standard Gaussian distribution N(0,1), we can <strong>sample random points from it</strong> and decode them into realistic new data.</p>
+<p>This is impossible with a regular AE — sampling random points there gives garbage. With a VAE, the smooth latent space means every point decodes to something meaningful.</p>
+</div>
+""", unsafe_allow_html=True)
+
+        n_gen = st.slider("Number of samples to generate", 4, 32, 16, 4)
+        temperature = st.slider("Temperature (sampling spread)", 0.1, 2.0, 1.0, 0.1,
+                                 help="Higher = more diverse but less accurate. Lower = conservative.")
+        st.markdown('<div style="color:#8892b0;font-size:0.78rem;">⚙️ Temperature scales the noise — higher temp samples from a wider distribution → more variety, less fidelity.</div>', unsafe_allow_html=True)
+
+        np.random.seed(st.session_state.get("gen_seed", 0))
+        z_random = np.random.randn(n_gen, vae_latent) * temperature
+        generated = vae_decode(z_random, Wd1, bd1, Wo, bo)
+
+        if vae_ds == "Digits (MNIST-like)":
+            cols_per_row = 8
+            rows = (n_gen + cols_per_row - 1) // cols_per_row
+            fig, axes = plt.subplots(rows, cols_per_row, figsize=(cols_per_row*1.5, rows*1.8))
+            fig.patch.set_facecolor('#0a0f1e')
+            axes = np.array(axes).reshape(rows, cols_per_row)
+            for i in range(rows * cols_per_row):
+                ax = axes[i // cols_per_row, i % cols_per_row]
+                ax.set_facecolor('#0a0f1e'); ax.axis('off')
+                if i < n_gen:
+                    ax.imshow(generated[i].reshape(8,8), cmap='Blues', vmin=-2, vmax=2)
+                    ax.set_title(f"gen {i}", color='#8892b0', fontsize=6)
+            fig.suptitle(f'VAE Generated Digits — Temperature={temperature:.1f}',
+                         color='#4fc3f7', fontsize=11, fontweight='bold')
+            plt.tight_layout(); st.pyplot(fig); plt.close()
+        else:
+            fig, ax = plt.subplots(figsize=(8,4)); style_ax(ax, fig)
+            ax.scatter(generated[:,0], generated[:,1], c='#ab47bc', s=80,
+                       alpha=0.8, edgecolors='white', lw=0.5, label='Generated', marker='*', zorder=5)
+            ax.scatter(X_vae[:,0], X_vae[:,1], c='#4fc3f7', s=20,
+                       alpha=0.4, edgecolors='none', label='Real data')
+            ax.set_title(f'Generated vs Real Samples | Temperature={temperature:.1f}',
+                         color='#4fc3f7', fontsize=11, fontweight='bold')
+            ax.legend(facecolor='#0d1b2a', labelcolor='#ccd6f6', edgecolor='#1e3a5f')
+            st.pyplot(fig); plt.close()
+
+        if st.button("🎲 Resample"):
+            import random
+            st.session_state["gen_seed"] = random.randint(0, 9999)
+            st.rerun()
+
+    # ── TAB 4: Latent Space ───────────────────────────────────
+    with tab4:
+        st.markdown("### 🗺️ Latent Space Explorer")
+        st.markdown("""
+<div class="card">
+<h3>🗺️ Why the Latent Space Matters</h3>
+<p>The VAE's latent space is <strong>smooth and continuous</strong> — unlike a regular AE. This means:</p>
+<ul>
+<li>Similar inputs land in nearby regions</li>
+<li>You can <strong>interpolate</strong> between two points and get meaningful transitions</li>
+<li>The whole space is "filled" — no dead zones</li>
+</ul>
+<p>Below you can see the encoded positions of all training samples. Even without class labels during training, the VAE naturally clusters similar inputs together!</p>
+</div>
+""", unsafe_allow_html=True)
+
+        if vae_latent >= 2:
+            fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+            fig.patch.set_facecolor('#0a0f1e')
+            for ax in axes: style_ax(ax)
+
+            # Left: colored by class label
+            n_cls = len(np.unique(y_vae))
+            for i in range(n_cls):
+                mask = y_vae == i
+                axes[0].scatter(mu_all[mask,0], mu_all[mask,1],
+                                c=COLORS[i%len(COLORS)], s=30, alpha=0.75,
+                                edgecolors='white', lw=0.2, label=f'Class {i}')
+            axes[0].set_title("Latent Space — colored by class", color='#4fc3f7', fontsize=11, fontweight='bold')
+            axes[0].set_xlabel("z₁ (μ)", color='#8892b0'); axes[0].set_ylabel("z₂ (μ)", color='#8892b0')
+            axes[0].legend(fontsize=8, facecolor='#0d1b2a', labelcolor='#ccd6f6', edgecolor='#1e3a5f')
+
+            # Right: colored by uncertainty (std)
+            std_all = np.exp(0.5 * lv_all)
+            uncertainty = std_all.mean(axis=1)
+            sc = axes[1].scatter(mu_all[:,0], mu_all[:,1], c=uncertainty,
+                                  cmap='plasma', s=30, alpha=0.8, edgecolors='none')
+            plt.colorbar(sc, ax=axes[1], label='Mean σ (uncertainty)')
+            axes[1].set_title("Latent Space — colored by uncertainty σ", color='#4fc3f7', fontsize=11, fontweight='bold')
+            axes[1].set_xlabel("z₁ (μ)", color='#8892b0'); axes[1].set_ylabel("z₂ (μ)", color='#8892b0')
+
+            plt.tight_layout(); st.pyplot(fig); plt.close()
+
+            st.info("💡 **Left**: classes naturally cluster — learned without labels! "
+                    "**Right**: bright = uncertain encoding (near class boundaries)")
+
+            # Interpolation between two classes
+            st.markdown("### 🔀 Latent Space Interpolation")
+            st.markdown("Pick two class centers and walk a straight line between them in latent space:")
+
+            n_steps = 10
+            c_avail = list(range(n_cls))
+            ic1, ic2 = st.columns(2)
+            with ic1: ca = st.selectbox("From class", c_avail, index=0, key="vae_ca")
+            with ic2: cb = st.selectbox("To class",   c_avail, index=min(1,n_cls-1), key="vae_cb")
+
+            mu_a = mu_all[y_vae==ca].mean(0)
+            mu_b = mu_all[y_vae==cb].mean(0)
+            alphas = np.linspace(0, 1, n_steps)
+            z_interp = np.array([(1-a)*mu_a + a*mu_b for a in alphas])
+            x_interp = vae_decode(z_interp, Wd1, bd1, Wo, bo)
+
+            if vae_ds == "Digits (MNIST-like)":
+                fig, axes2 = plt.subplots(1, n_steps, figsize=(14, 2))
+                fig.patch.set_facecolor('#0a0f1e')
+                for i, (ax, img) in enumerate(zip(axes2, x_interp)):
+                    ax.imshow(img.reshape(8,8), cmap='Blues', vmin=-2, vmax=2)
+                    ax.axis('off')
+                    ax.set_title(f'{alphas[i]:.1f}', color='#8892b0', fontsize=6)
+                fig.suptitle(f'Interpolation: Class {ca} → Class {cb}',
+                             color='#4fc3f7', fontsize=10, fontweight='bold')
+                plt.tight_layout(); st.pyplot(fig); plt.close()
+            else:
+                fig, ax = plt.subplots(figsize=(8,3)); style_ax(ax, fig)
+                ax.scatter(mu_all[y_vae==ca,0], mu_all[y_vae==ca,1], c=COLORS[ca%len(COLORS)], s=20, alpha=0.4)
+                ax.scatter(mu_all[y_vae==cb,0], mu_all[y_vae==cb,1], c=COLORS[cb%len(COLORS)], s=20, alpha=0.4)
+                ax.plot(z_interp[:,0], z_interp[:,1], 'o-', color='#00e5ff', lw=2.5,
+                        markersize=8, label=f'Class {ca} → {cb}', zorder=5)
+                ax.legend(facecolor='#0d1b2a', labelcolor='#ccd6f6', edgecolor='#1e3a5f')
+                ax.set_title(f'Interpolation path in latent space',
+                             color='#4fc3f7', fontsize=11, fontweight='bold')
+                plt.tight_layout(); st.pyplot(fig); plt.close()
+        else:
+            fig, ax = plt.subplots(figsize=(10,3)); style_ax(ax, fig)
+            n_cls = len(np.unique(y_vae))
+            for i in range(n_cls):
+                mask = y_vae == i
+                ax.scatter(mu_all[mask,0], np.zeros(mask.sum()) + i*0.15,
+                           c=COLORS[i%len(COLORS)], s=40, alpha=0.8, label=f'Class {i}')
+            ax.set_title("1D Latent Space — set Latent Dim ≥ 2 for full visualization",
+                         color='#4fc3f7', fontsize=11, fontweight='bold')
+            ax.legend(facecolor='#0d1b2a', labelcolor='#ccd6f6', edgecolor='#1e3a5f')
+            plt.tight_layout(); st.pyplot(fig); plt.close()
+
+
 st.markdown("---")
 st.markdown("""
 <div style="text-align:center;color:#8892b0;font-family:'JetBrains Mono',monospace;font-size:0.75rem;padding:0.4rem 0;">
