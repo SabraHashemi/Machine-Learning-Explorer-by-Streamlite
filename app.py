@@ -221,7 +221,7 @@ with st.sidebar:
         "Algorithm",
         ["⚡ SVM", "📈 Regression", "🌳 Decision Tree / RF",
          "🔵 K-Means Clustering", "👥 KNN", "🧠 Neural Network (MLP)",
-         "🔁 AutoEncoder", "🎲 VAE (Variational)"],
+         "🔁 AutoEncoder", "🎲 VAE (Variational)", "🔗 Contrastive Learning"],
         label_visibility="collapsed"
     )
     st.markdown("---")
@@ -1989,10 +1989,673 @@ far from the normal cluster, or scattered randomly.</p>
         plt.tight_layout(); st.pyplot(fig); plt.close()
 
 
+# ══════════════════════════════════════════════════════════════
+# ██  CONTRASTIVE LEARNING
+# ══════════════════════════════════════════════════════════════
+elif algo == "🔗 Contrastive Learning":
+    st.markdown("""
+<div class="main-header">
+<h1>🔗 Contrastive Learning</h1>
+<p>Learn powerful representations without labels — by teaching the model what's similar and what's different</p>
+</div>""", unsafe_allow_html=True)
+
+    # ═══════════════════════════════════════════════════════════
+    # SIDEBAR
+    # ═══════════════════════════════════════════════════════════
+    with st.sidebar:
+        st.markdown("### ⚙️ Settings")
+
+        st.markdown("""<div style="color:#8892b0;font-size:0.75rem;margin-bottom:3px;">
+        🗜️ <b>Projection Dimension</b><br>
+        Size of the embedding space where contrastive loss is applied.
+        Too small = not enough room to separate. Too large = overfits noise.
+        <b>32–128 is typical.</b></div>""", unsafe_allow_html=True)
+        proj_dim = st.slider("Projection Dimension", 2, 128, 32, 2, key="cl_proj")
+
+        st.markdown("""<div style="color:#8892b0;font-size:0.75rem;margin:8px 0 3px;">
+        🌡️ <b>Temperature τ (tau)</b><br>
+        Controls how "sharp" the similarity distribution is.<br>
+        • <b>Low τ (0.05–0.1)</b>: very sharp — model focuses on the hardest negatives. Learns faster but can be unstable.<br>
+        • <b>High τ (0.5+)</b>: soft — treats all negatives similarly. More stable but slower.<br>
+        <b>0.1 is the SimCLR default.</b></div>""", unsafe_allow_html=True)
+        temperature = st.slider("Temperature τ", 0.01, 1.0, 0.1, 0.01, key="cl_temp")
+
+        st.markdown("""<div style="color:#8892b0;font-size:0.75rem;margin:8px 0 3px;">
+        🔄 <b>Epochs</b><br>
+        Contrastive learning usually needs more epochs than supervised learning
+        because the signal per sample is weaker (no labels).<br>
+        100–300 is fine for these small datasets.</div>""", unsafe_allow_html=True)
+        cl_epochs = st.slider("Epochs", 50, 400, 150, 50, key="cl_ep")
+
+        st.markdown("""<div style="color:#8892b0;font-size:0.75rem;margin:8px 0 3px;">
+        ⚡ <b>Learning Rate</b><br>
+        Contrastive learning is sensitive to LR.<br>
+        0.001–0.01 works well. Too high → embeddings collapse to a single point.</div>""", unsafe_allow_html=True)
+        cl_lr = st.select_slider("Learning Rate", [0.0001,0.001,0.005,0.01,0.05], value=0.005, key="cl_lr")
+
+        st.markdown("""<div style="color:#8892b0;font-size:0.75rem;margin:8px 0 3px;">
+        🎭 <b>Augmentation Noise</b><br>
+        How much random noise to add when creating two "views" of the same sample.
+        This is the core of data augmentation in contrastive learning.<br>
+        • Too low: views are identical → trivial task, no learning<br>
+        • Too high: views are too different → impossible task</div>""", unsafe_allow_html=True)
+        aug_noise = st.slider("Augmentation Noise σ", 0.01, 0.8, 0.15, 0.01, key="cl_aug")
+
+        st.markdown("---")
+        st.markdown("### 📊 Data")
+        cl_ds = st.selectbox("Dataset", ["Digits (MNIST-like)", "Iris", "Blobs", "Moons"], key="cl_ds")
+
+    # ═══════════════════════════════════════════════════════════
+    # TABS
+    # ═══════════════════════════════════════════════════════════
+    tab1,tab2,tab3,tab4 = st.tabs([
+        "📖 Core Concepts",
+        "🎭 Augmentation",
+        "📉 Training",
+        "🗺️ Embedding Space"
+    ])
+
+    # ═══════════════════════════════════════════════════════════
+    # DATA
+    # ═══════════════════════════════════════════════════════════
+    @st.cache_data
+    def get_cl_data(name):
+        if name == "Digits (MNIST-like)":
+            d = datasets.load_digits()
+            X, y = d.data.astype(np.float32), d.target
+        elif name == "Iris":
+            d = datasets.load_iris()
+            X, y = d.data.astype(np.float32), d.target
+        elif name == "Moons":
+            X, y = datasets.make_moons(300, noise=0.15, random_state=42)
+            X = X.astype(np.float32)
+        else:
+            X, y = datasets.make_blobs(300, centers=4, n_features=4, random_state=42)
+            X = X.astype(np.float32)
+        sc = StandardScaler()
+        X = sc.fit_transform(X).astype(np.float32)
+        return X, y
+
+    X_cl, y_cl = get_cl_data(cl_ds)
+    n_in_cl    = X_cl.shape[1]
+    n_cls_cl   = len(np.unique(y_cl))
+
+    # ═══════════════════════════════════════════════════════════
+    # NUMPY SimCLR-style encoder
+    # ═══════════════════════════════════════════════════════════
+    def relu(x):    return np.maximum(0, x)
+    def relu_d(x):  return (x > 0).astype(float)
+
+    def cl_forward(X, W1, b1, W2, b2, W3, b3):
+        """Encoder (2 layers) + projection head (1 layer)"""
+        h1  = relu(X  @ W1 + b1)   # (N, hidden)
+        h2  = relu(h1 @ W2 + b2)   # (N, hidden)
+        z   = h2 @ W3 + b3          # (N, proj_dim) — projection head output
+        # L2-normalise → embeddings live on unit hypersphere
+        norm = np.linalg.norm(z, axis=1, keepdims=True) + 1e-8
+        return h2, z / norm
+
+    def nt_xent_loss(z_i, z_j, tau):
+        """
+        Normalised Temperature-scaled Cross Entropy Loss (NT-Xent)
+        Used in SimCLR.  z_i, z_j are already L2-normalised.
+        For batch size N we have 2N samples total.
+        The positive pair for sample k is sample k+N (its augmented twin).
+        All other 2N-2 samples are negatives.
+        """
+        N   = len(z_i)
+        Z   = np.concatenate([z_i, z_j], axis=0)          # (2N, d)
+        sim = Z @ Z.T / tau                                 # (2N, 2N) cosine similarity / tau
+        # mask out self-similarity on diagonal
+        np.fill_diagonal(sim, -1e9)
+        # positives: (i, i+N) and (i+N, i)
+        pos_mask = np.zeros((2*N, 2*N), dtype=bool)
+        for k in range(N):
+            pos_mask[k,   k+N] = True
+            pos_mask[k+N, k  ] = True
+        # log-softmax trick for numerical stability
+        sim_max  = sim.max(axis=1, keepdims=True)
+        log_sum  = np.log(np.exp(sim - sim_max).sum(axis=1, keepdims=True)) + sim_max
+        log_prob = sim - log_sum
+        loss     = -log_prob[pos_mask].mean()
+        return loss
+
+    def augment(X, sigma):
+        """Simple Gaussian noise augmentation — creates a 'different view' of the same sample"""
+        return X + np.random.randn(*X.shape).astype(np.float32) * sigma
+
+    @st.cache_data
+    def train_cl(X, proj_dim, tau, epochs, lr, aug_sigma, seed=42):
+        np.random.seed(seed)
+        n   = X.shape[1]
+        hid = 64
+        # Xavier init
+        W1 = np.random.randn(n,   hid)      * np.sqrt(2/n)
+        b1 = np.zeros((1, hid))
+        W2 = np.random.randn(hid, hid)      * np.sqrt(2/hid)
+        b2 = np.zeros((1, hid))
+        W3 = np.random.randn(hid, proj_dim) * np.sqrt(2/hid)
+        b3 = np.zeros((1, proj_dim))
+
+        losses = []
+        bs = min(128, len(X))
+
+        for ep in range(epochs):
+            idx      = np.random.permutation(len(X))
+            ep_loss  = 0.0
+            n_batches = 0
+
+            for i in range(0, len(X) - bs + 1, bs):
+                Xb = X[idx[i:i+bs]]          # (B, n)
+                B  = len(Xb)
+
+                # ── Two augmented views ───────────────────────
+                Xi = augment(Xb, aug_sigma)   # (B, n)
+                Xj = augment(Xb, aug_sigma)   # (B, n)
+
+                # ── Forward pass (manual, keep all intermediates) ──
+                # View i
+                a1i = relu(Xi @ W1 + b1)      # (B, hid)
+                a2i = relu(a1i @ W2 + b2)     # (B, hid)
+                p_i = a2i @ W3 + b3           # (B, proj_dim)  — pre-norm
+                n_i = np.linalg.norm(p_i, axis=1, keepdims=True) + 1e-8
+                zi  = p_i / n_i               # (B, proj_dim)  — L2-normalised
+
+                # View j
+                a1j = relu(Xj @ W1 + b1)
+                a2j = relu(a1j @ W2 + b2)
+                p_j = a2j @ W3 + b3
+                n_j = np.linalg.norm(p_j, axis=1, keepdims=True) + 1e-8
+                zj  = p_j / n_j
+
+                loss = nt_xent_loss(zi, zj, tau)
+                ep_loss += loss; n_batches += 1
+
+                # ── Gradient of NT-Xent w.r.t. zi and zj ─────
+                Z   = np.concatenate([zi, zj], axis=0)   # (2B, proj_dim)
+                sim = Z @ Z.T / tau                       # (2B, 2B)
+                np.fill_diagonal(sim, -1e9)
+                sim = sim - sim.max(axis=1, keepdims=True)
+                exp_sim  = np.exp(sim)
+                softmax  = exp_sim / exp_sim.sum(axis=1, keepdims=True)  # (2B, 2B)
+
+                dL_dZ = softmax.copy()                    # (2B, proj_dim) — wait, this is wrong shape
+                # dL_dZ is (2B, 2B); we need to convert to grad w.r.t. Z rows (2B, proj_dim)
+                # dL/dZ_k = (1/tau) * sum_l [ (softmax[k,l] - indicator_positive[k,l]) * Z[l] ]
+                pos_mask = np.zeros((2*B, 2*B))
+                for k in range(B):
+                    pos_mask[k,   k+B] = 1.0
+                    pos_mask[k+B, k  ] = 1.0
+                grad_sim = (softmax - pos_mask) / (2 * B * tau)   # (2B, 2B)
+                dL_dZ    = grad_sim @ Z + grad_sim.T @ Z           # (2B, proj_dim)
+
+                dL_dzi = dL_dZ[:B]   # (B, proj_dim)
+                dL_dzj = dL_dZ[B:]   # (B, proj_dim)
+
+                # ── Backprop through L2-norm ───────────────────
+                # d/dp (p/||p||) = (I - z z^T) / ||p||
+                def backprop_norm(dL_dz, p, n_norm):
+                    # dL_dz: (B, proj_dim), p: (B, proj_dim), n_norm: (B, 1)
+                    z = p / n_norm
+                    dot = (dL_dz * z).sum(axis=1, keepdims=True)  # (B,1)
+                    return (dL_dz - z * dot) / n_norm              # (B, proj_dim)
+
+                dL_dpi = backprop_norm(dL_dzi, p_i, n_i)  # (B, proj_dim)
+                dL_dpj = backprop_norm(dL_dzj, p_j, n_j)  # (B, proj_dim)
+
+                # ── Backprop through projection head W3 ───────
+                # p = a2 @ W3 + b3
+                dW3 = np.clip(a2i.T @ dL_dpi + a2j.T @ dL_dpj, -1, 1)  # (hid, proj_dim)
+                db3 = np.clip((dL_dpi + dL_dpj).sum(0, keepdims=True),  -1, 1)
+
+                da2i = dL_dpi @ W3.T   # (B, hid)
+                da2j = dL_dpj @ W3.T
+
+                # ── Backprop through encoder layer 2 ──────────
+                # a2 = relu(a1 @ W2 + b2)
+                dz2i = da2i * relu_d(a1i @ W2 + b2)  # (B, hid)
+                dz2j = da2j * relu_d(a1j @ W2 + b2)
+
+                dW2 = np.clip(a1i.T @ dz2i + a1j.T @ dz2j, -2, 2)  # (hid, hid)
+                db2 = np.clip((dz2i + dz2j).sum(0, keepdims=True),  -2, 2)
+
+                da1i = dz2i @ W2.T   # (B, hid)
+                da1j = dz2j @ W2.T
+
+                # ── Backprop through encoder layer 1 ──────────
+                # a1 = relu(X @ W1 + b1)
+                dz1i = da1i * relu_d(Xi @ W1 + b1)   # (B, hid)
+                dz1j = da1j * relu_d(Xj @ W1 + b1)
+
+                dW1 = np.clip(Xi.T @ dz1i + Xj.T @ dz1j, -2, 2)  # (n, hid)
+                db1 = np.clip((dz1i + dz1j).sum(0, keepdims=True), -2, 2)
+
+                # ── Update ────────────────────────────────────
+                W1 -= lr * dW1;  b1 -= lr * db1
+                W2 -= lr * dW2;  b2 -= lr * db2
+                W3 -= lr * dW3;  b3 -= lr * db3
+
+            losses.append(ep_loss / max(n_batches, 1))
+
+        return (W1, b1, W2, b2, W3, b3), losses
+
+    # ── Get embeddings before and after training ──────────────
+    @st.cache_data
+    def get_random_weights(n_in, proj_dim, seed=42):
+        np.random.seed(seed)
+        hid=64
+        W1=np.random.randn(n_in,hid)*np.sqrt(2/n_in); b1=np.zeros((1,hid))
+        W2=np.random.randn(hid,hid)*np.sqrt(2/hid);   b2=np.zeros((1,hid))
+        W3=np.random.randn(hid,proj_dim)*np.sqrt(2/hid);b3=np.zeros((1,proj_dim))
+        return (W1,b1,W2,b2,W3,b3)
+
+    w_rand = get_random_weights(n_in_cl, proj_dim)
+    _, emb_before = cl_forward(X_cl, *w_rand)
+
+    with st.spinner("Training contrastive model (no labels used!)..."):
+        w_cl, cl_losses = train_cl(X_cl, proj_dim, temperature, cl_epochs, cl_lr, aug_noise)
+    _, emb_after = cl_forward(X_cl, *w_cl)
+
+    # ── PCA to 2D for visualisation ───────────────────────────
+    def pca2d(Z):
+        Z = Z - Z.mean(0)
+        _, _, Vt = np.linalg.svd(Z, full_matrices=False)
+        return Z @ Vt[:2].T
+
+    eb2 = pca2d(emb_before)
+    ea2 = pca2d(emb_after)
+
+    # ─────────────────────────────────────────────────────────
+    # TAB 1 — Core Concepts
+    # ─────────────────────────────────────────────────────────
+    with tab1:
+        st.markdown("## What is Contrastive Learning?")
+
+        c1,c2 = st.columns([1,1])
+        with c1:
+            st.markdown("""
+<div class="card">
+<h3>🤔 The Big Problem: Learning Without Labels</h3>
+<p>Labelling data is expensive and slow. A doctor labels 1000 X-rays.
+A factory needs to annotate 50,000 defect images.
+Supervised learning is hungry for labels.</p>
+<p>Contrastive learning says: <b>"What if we could learn useful representations
+just by comparing data points to each other — no labels at all?"</b></p>
+<div class="highlight">💡 The core insight: you don't need labels to know that two photos of the same dog should be similar,
+and a photo of a dog and a cat should be different.</div>
+</div>
+
+<div class="card">
+<h3>🎓 The Fundamental Idea — Pull & Push</h3>
+<p>Contrastive learning works with two forces acting on the embedding space:</p>
+<ul>
+<li><b>Pull</b>: similar samples → embeddings should be <b>close together</b></li>
+<li><b>Push</b>: different samples → embeddings should be <b>far apart</b></li>
+</ul>
+<p>After training, the embedding space is organized so that semantically similar
+things cluster together — even though we never told the model what the classes were.</p>
+<div class="highlight">💡 Think of it as learning a "similarity map" of your data from scratch</div>
+</div>
+
+<div class="card">
+<h3>🎭 What are Positive and Negative Pairs?</h3>
+<ul>
+<li><b>Positive pair</b>: two versions of the <em>same</em> sample (e.g., the same image with different crops, rotations, or noise). The model should embed these close together.</li>
+<li><b>Negative pair</b>: two <em>different</em> samples. The model should push these apart.</li>
+</ul>
+<p>In SimCLR (the most famous method), every sample in a batch is augmented twice.
+Each sample's two augmented versions are a positive pair.
+All other samples in the batch are negatives.</p>
+<div class="highlight">💡 With batch size 256: each sample has 1 positive and 510 negatives to push away from!</div>
+</div>
+
+<div class="card">
+<h3>🌡️ What is NT-Xent Loss (the Contrastive Loss)?</h3>
+<p>NT-Xent = <b>Normalised Temperature-scaled Cross Entropy</b>. For each sample i:</p>
+<ol>
+<li>Compute cosine similarity between its embedding and all other 2N-1 embeddings</li>
+<li>Divide similarities by temperature τ (sharpening)</li>
+<li>Apply softmax → treat as a classification problem: "which one is my positive?"</li>
+<li>Maximise the probability assigned to the true positive</li>
+</ol>
+<p>Minimising NT-Xent pushes positive pairs together and negative pairs apart simultaneously.</p>
+<div class="highlight">💡 It's like asking the model: "out of all these samples, which one is your twin?" — and penalising wrong answers</div>
+</div>
+
+<div class="card">
+<h3>⚠️ The Collapse Problem</h3>
+<p>A trivial solution exists: embed everything to the same point.
+Then all positives are perfectly close — but so are all negatives. Loss = 0 but the model learned nothing.</p>
+<p>This is called <b>representation collapse</b>. Solutions:</p>
+<ul>
+<li><b>NT-Xent</b>: the negative pairs in the denominator prevent collapse — if everything collapses, negatives get high similarity too, which increases the loss</li>
+<li><b>Large batches</b>: more negatives = harder to collapse</li>
+<li><b>L2 normalisation</b>: embeddings on a unit sphere — collapse means all points pile up in one spot, which NT-Xent penalises</li>
+</ul>
+<div class="highlight">💡 The negatives are what prevent the model from cheating — they're the hard constraints</div>
+</div>
+
+<div class="card">
+<h3>🔗 The Encoder + Projection Head Architecture</h3>
+<p>SimCLR uses a two-part network:</p>
+<ul>
+<li><b>Encoder f(·)</b>: the main network (e.g., ResNet, MLP). Extracts features. <em>This is what you keep after training.</em></li>
+<li><b>Projection Head g(·)</b>: a small MLP on top. Contrastive loss is applied here. <em>This is thrown away after training!</em></li>
+</ul>
+<p>Why discard the projection head? Chen et al. (SimCLR) showed that the encoder representations are more general and transferable than the projection head's output. The projection head "overfits" to the augmentation strategy.</p>
+<div class="highlight">💡 You train with the projection head, but you use the encoder for downstream tasks (classification, clustering, etc.)</div>
+</div>
+""", unsafe_allow_html=True)
+
+        with c2:
+            # ── Visual 1: Pull & Push diagram ────────────────
+            fig,ax=plt.subplots(figsize=(7,4))
+            fig.patch.set_facecolor('#0a0f1e'); ax.set_facecolor('#0d1b2a'); ax.axis('off')
+            # Draw two clusters
+            np.random.seed(7)
+            pts_a = np.random.randn(6,2)*0.25 + [-1.5, 0.8]
+            pts_b = np.random.randn(6,2)*0.25 + [ 1.5, 0.8]
+            pts_a2= pts_a + np.random.randn(6,2)*0.5  # augmented versions scattered
+            pts_b2= pts_b + np.random.randn(6,2)*0.5
+
+            # Before: scattered
+            ax.scatter(pts_a2[:,0]-0.3, pts_a2[:,1]-1.8, c='#4fc3f7', s=70, alpha=0.5, marker='o')
+            ax.scatter(pts_b2[:,0]+0.3, pts_b2[:,1]-1.8, c='#ef5350', s=70, alpha=0.5, marker='o')
+            ax.text(0, -1.0, 'Before training\n(random embeddings)', ha='center',
+                    color='#8892b0', fontsize=8.5, fontfamily='monospace')
+
+            # After: clustered
+            ax.scatter(pts_a[:,0], pts_a[:,1], c='#4fc3f7', s=70, alpha=0.9, marker='o', zorder=5)
+            ax.scatter(pts_b[:,0], pts_b[:,1], c='#ef5350', s=70, alpha=0.9, marker='o', zorder=5)
+            # Pull arrows within cluster A
+            ctr_a = pts_a.mean(0)
+            for p in pts_a[:3]:
+                ax.annotate('',xy=ctr_a,xytext=p,
+                            arrowprops=dict(arrowstyle='->',color='#00e5ff',lw=1.2,alpha=0.7))
+            # Push arrow between clusters
+            ax.annotate('',xy=pts_b.mean(0),xytext=pts_a.mean(0),
+                        arrowprops=dict(arrowstyle='<->',color='#ffa726',lw=2.5,
+                                        connectionstyle='arc3,rad=0.3'))
+            ax.text(0, 1.7, '← Push apart →', ha='center', color='#ffa726',
+                    fontsize=8.5, fontfamily='monospace', fontweight='bold')
+            ax.text(-1.5,0.1,'Pull\ntogether',ha='center',color='#00e5ff',
+                    fontsize=8, fontfamily='monospace')
+            ax.text(0, -0.2, 'After training\n(organised embeddings)', ha='center',
+                    color='#8892b0', fontsize=8.5, fontfamily='monospace')
+            ax.set_xlim(-3,3); ax.set_ylim(-2.5,2.5)
+            ax.set_title('The Pull & Push Mechanism', color='#4fc3f7',
+                         fontsize=11, fontweight='bold')
+            st.pyplot(fig); plt.close()
+
+            # ── Visual 2: Architecture diagram ───────────────
+            fig,ax=plt.subplots(figsize=(7,4.5))
+            fig.patch.set_facecolor('#0a0f1e'); ax.set_facecolor('#0a0f1e'); ax.axis('off')
+            boxes = [
+                (0.05,0.60,'#0d2b45','#4fc3f7','Sample x'),
+                (0.05,0.25,'#0d2b45','#4fc3f7','Augment\nx_i  x_j'),
+                (0.35,0.25,'#112240','#66bb6a','Encoder f(·)\n(keep this!)'),
+                (0.65,0.25,'#1a0d30','#ab47bc','Proj Head g(·)\n(discard after)'),
+            ]
+            for x,y,fc,ec,lbl in boxes:
+                ax.add_patch(plt.Rectangle((x,y),0.22,0.18,fc=fc,ec=ec,lw=2,zorder=3))
+                ax.text(x+0.11,y+0.09,lbl,ha='center',va='center',color='white',
+                        fontsize=8,fontfamily='monospace',fontweight='bold',zorder=5)
+            # arrows
+            arrows_diag = [
+                (0.27,0.34,0.35,0.34,'#4fc3f7'),
+                (0.57,0.34,0.65,0.34,'#66bb6a'),
+                (0.76,0.34,0.82,0.34,'#ab47bc'),
+                (0.16,0.60,0.16,0.43,'#4fc3f7'),
+            ]
+            for x1,y1,x2,y2,col in arrows_diag:
+                ax.annotate('',xy=(x2,y2),xytext=(x1,y1),
+                            arrowprops=dict(arrowstyle='->',color=col,lw=2))
+            ax.text(0.87,0.34,'NT-Xent\nLoss',ha='left',va='center',color='#00e5ff',
+                    fontsize=8.5,fontfamily='monospace',fontweight='bold')
+            ax.text(0.46,0.10,'h (representation)',ha='center',color='#66bb6a',
+                    fontsize=8,fontfamily='monospace')
+            ax.text(0.75,0.10,'z (projection)',ha='center',color='#ab47bc',
+                    fontsize=8,fontfamily='monospace')
+            ax.text(0.16,0.82,'Input x',ha='center',color='#8892b0',
+                    fontsize=8.5,fontfamily='monospace')
+            ax.set_xlim(0,1.1); ax.set_ylim(0,1)
+            ax.set_title('SimCLR Architecture', color='#4fc3f7',
+                         fontsize=11, fontweight='bold')
+            st.pyplot(fig); plt.close()
+
+            # ── Visual 3: NT-Xent explained ──────────────────
+            fig,ax=plt.subplots(figsize=(7,3))
+            fig.patch.set_facecolor('#0a0f1e'); ax.set_facecolor('#0d1b2a')
+            ax.tick_params(colors='#8892b0',labelsize=8)
+            for sp in ax.spines.values(): sp.set_edgecolor('#1e3a5f')
+            labels=['z_i (self)','z_j\n(positive)','neg 1','neg 2','neg 3','neg 4','neg 5']
+            sims  = [-10, 0.85,  -0.3, 0.1, -0.5,  0.2, -0.1]
+            colors= ['#555','#00e5ff','#ef5350','#ef5350','#ef5350','#ef5350','#ef5350']
+            ax.bar(labels,sims,color=colors,alpha=0.85,edgecolor='#0a0f1e',linewidth=0.5)
+            ax.axhline(0,color='#1e3a5f',lw=1)
+            ax.set_ylabel('Cosine similarity / τ',color='#8892b0',fontsize=8)
+            ax.set_title('NT-Xent: what the loss sees for one sample',
+                         color='#4fc3f7',fontsize=10,fontweight='bold')
+            ax.text(1,0.88,'← maximise this',ha='center',color='#00e5ff',
+                    fontsize=7.5,fontfamily='monospace')
+            st.pyplot(fig); plt.close()
+
+    # ─────────────────────────────────────────────────────────
+    # TAB 2 — Augmentation
+    # ─────────────────────────────────────────────────────────
+    with tab2:
+        st.markdown("## 🎭 The Role of Data Augmentation")
+
+        st.markdown("""
+<div class="card">
+<h3>🎭 Augmentation is the Heart of Contrastive Learning</h3>
+<p>The choice of augmentation defines what the model considers "the same".
+If you augment with brightness changes, the model learns brightness-invariant features.
+If you augment with rotations, it learns rotation-invariant features.</p>
+<p>In tabular/numerical data (like we have here), augmentation = adding Gaussian noise.
+In images, common augmentations are: random crop, colour jitter, gaussian blur, horizontal flip.</p>
+<div class="highlight">💡 The augmentation is your domain knowledge encoded implicitly — you're telling the model "these transformations don't change the identity of a sample"</div>
+</div>
+
+<div class="card">
+<h3>⚖️ The Noise Trade-off</h3>
+<p>The augmentation noise σ (sigma) controls how different the two views are:</p>
+<ul>
+<li><b>σ too small</b>: views are nearly identical → trivial task → model learns nothing meaningful. Like asking "are these two photos of the same person?" when they're pixel-identical.</li>
+<li><b>σ just right</b>: views are different enough to be challenging but similar enough to share structure → model must learn what's truly invariant.</li>
+<li><b>σ too large</b>: views are so different they no longer share the same structure → impossible task → loss explodes, model fails.</li>
+</ul>
+<div class="highlight">💡 Current noise level: σ = {:.2f}. Try moving the slider and watching how embeddings change in the Embedding Space tab.</div>
+</div>
+""".format(aug_noise), unsafe_allow_html=True)
+
+        # Show augmentation effect
+        st.markdown("### 👀 Visualising Augmented Pairs")
+        if cl_ds == "Digits (MNIST-like)":
+            np.random.seed(5)
+            n_show = 6
+            indices = np.random.choice(len(X_cl), n_show, replace=False)
+            fig,axes=plt.subplots(3,n_show,figsize=(n_show*1.8,5.5))
+            fig.patch.set_facecolor('#0a0f1e')
+            row_lbls=['Original','View 1 (aug)','View 2 (aug)']
+            row_cols=['#8892b0','#4fc3f7','#ab47bc']
+            for c,idx in enumerate(indices):
+                v1 = augment(X_cl[[idx]], aug_noise)[0]
+                v2 = augment(X_cl[[idx]], aug_noise)[0]
+                for r,(data,cmap) in enumerate([(X_cl[idx],'Blues'),(v1,'Blues'),(v2,'Purples')]):
+                    ax=axes[r,c]
+                    ax.imshow(data.reshape(8,8),cmap=cmap,vmin=-2,vmax=2)
+                    ax.axis('off')
+                    if c==0:
+                        ax.set_ylabel(row_lbls[r],color=row_cols[r],
+                                      fontsize=8.5,fontfamily='monospace')
+            fig.suptitle(f'Positive pairs: same digit, two noisy views (σ={aug_noise:.2f})',
+                         color='#4fc3f7',fontsize=11,fontweight='bold')
+            plt.tight_layout(); st.pyplot(fig); plt.close()
+        else:
+            np.random.seed(5)
+            n_show=8
+            idx=np.random.choice(len(X_cl),n_show,replace=False)
+            X_show=X_cl[idx]
+            V1=augment(X_show,aug_noise); V2=augment(X_show,aug_noise)
+            fig,axes=plt.subplots(1,3,figsize=(13,4)); fig.patch.set_facecolor('#0a0f1e')
+            for ax in axes: style_ax(ax)
+            for i in range(n_cls_cl):
+                m=y_cl[idx]==i
+                if m.any():
+                    axes[0].scatter(X_show[m,0],X_show[m,1],c=COLORS[i%len(COLORS)],
+                                    s=80,alpha=0.9,edgecolors='white',lw=0.5,label=f'cls {i}')
+                    axes[1].scatter(V1[m,0],V1[m,1],c=COLORS[i%len(COLORS)],
+                                    s=80,alpha=0.9,edgecolors='white',lw=0.5)
+                    axes[2].scatter(V2[m,0],V2[m,1],c=COLORS[i%len(COLORS)],
+                                    s=80,alpha=0.9,edgecolors='white',lw=0.5)
+            for ax,ttl in zip(axes,['Original','View 1 (augmented)','View 2 (augmented)']):
+                ax.set_title(ttl,color='#4fc3f7',fontsize=10,fontweight='bold')
+            axes[0].legend(fontsize=8,facecolor='#0d1b2a',labelcolor='#ccd6f6',edgecolor='#1e3a5f')
+            fig.suptitle(f'Positive pairs — same colour = same class (σ={aug_noise:.2f})',
+                         color='#4fc3f7',fontsize=11,fontweight='bold')
+            plt.tight_layout(); st.pyplot(fig); plt.close()
+
+        st.markdown("""
+<div class="card">
+<h3>🤔 Why Does This Work For Learning?</h3>
+<p>The model sees View 1 and View 2 and must embed them close together.
+To do this reliably (across the whole dataset), it can't just memorise pixel values —
+the noise makes them different every time.</p>
+<p>Instead, it must learn the <b>underlying structure</b> that both views share:
+the shape of the digit, the cluster it belongs to, the statistical pattern.</p>
+<p>This is exactly the representation we want for downstream tasks!</p>
+<div class="highlight">💡 This is the key intuition: augmentation forces the model to be invariant to surface-level noise and focus on deep structure</div>
+</div>""", unsafe_allow_html=True)
+
+    # ─────────────────────────────────────────────────────────
+    # TAB 3 — Training
+    # ─────────────────────────────────────────────────────────
+    with tab3:
+        st.markdown("### 📉 Training Progress")
+
+        st.markdown("""<div class="card">
+<h3>Reading the Loss Curve</h3>
+<ul>
+<li>Loss starts high — embeddings are random, the positive pair is no more similar than the negatives</li>
+<li>Loss decreases as the model learns to pull positives together and push negatives apart</li>
+<li>If loss <b>doesn't decrease at all</b> → try increasing learning rate or reducing temperature τ</li>
+<li>If loss <b>spikes or explodes</b> → learning rate too high or augmentation noise too large</li>
+<li>A well-trained model typically reaches a loss of 2–4 for small datasets (log(batch_size) is the random baseline)</li>
+</ul>
+<div class="highlight">💡 Random baseline loss ≈ log(batch_size) = {:.2f}. If your final loss is near this, the model hasn't learned anything.</div>
+</div>""".format(np.log(min(128,len(X_cl)))), unsafe_allow_html=True)
+
+        fig,ax=plt.subplots(figsize=(10,4)); style_ax(ax,fig)
+        ax.plot(cl_losses,color='#4fc3f7',lw=2.5,label='NT-Xent Loss')
+        ax.axhline(np.log(min(128,len(X_cl))),color='#ef5350',lw=1.5,
+                   ls='--',alpha=0.7,label=f'Random baseline ≈ {np.log(min(128,len(X_cl))):.2f}')
+        ax.set_xlabel("Epoch",color='#8892b0')
+        ax.set_ylabel("NT-Xent Loss",color='#8892b0')
+        ax.set_title(f"Contrastive Training Loss (τ={temperature}, σ={aug_noise})",
+                     color='#4fc3f7',fontsize=12,fontweight='bold')
+        ax.legend(fontsize=10,facecolor='#0d1b2a',labelcolor='#ccd6f6',edgecolor='#1e3a5f')
+        plt.tight_layout(); st.pyplot(fig); plt.close()
+
+        m1,m2,m3,m4=st.columns(4)
+        for col,lbl,val in zip([m1,m2,m3,m4],
+            ["📉 Final Loss","🎲 Random Baseline","📐 Proj Dim","🌡️ Temperature τ"],
+            [f"{cl_losses[-1]:.3f}",f"{np.log(min(128,len(X_cl))):.2f}",
+             str(proj_dim),str(temperature)]):
+            with col: st.markdown(metric_box(val,lbl),unsafe_allow_html=True)
+
+    # ─────────────────────────────────────────────────────────
+    # TAB 4 — Embedding Space
+    # ─────────────────────────────────────────────────────────
+    with tab4:
+        st.markdown("### 🗺️ Embedding Space — Before vs After Training")
+
+        st.markdown("""<div class="card">
+<h3>What to Look For</h3>
+<p>The two plots below show a PCA projection of all sample embeddings to 2D.
+<b>Remember: no class labels were used during training.</b></p>
+<ul>
+<li><b>Before</b>: random network → embeddings are scattered randomly, no structure</li>
+<li><b>After</b>: contrastive training → similar samples cluster together, even without labels</li>
+</ul>
+<p>The quality of clustering is a proxy for representation quality.
+Good clustering = the model has learned meaningful features.</p>
+<div class="highlight">💡 If the before and after look similar, try training longer or reducing temperature τ</div>
+</div>""", unsafe_allow_html=True)
+
+        fig,axes=plt.subplots(1,2,figsize=(13,5)); fig.patch.set_facecolor('#0a0f1e')
+        for ax in axes: style_ax(ax)
+        for ax,emb,ttl in zip(axes,[eb2,ea2],['Before Training (random weights)','After Contrastive Training']):
+            for i in range(n_cls_cl):
+                m=y_cl==i
+                ax.scatter(emb[m,0],emb[m,1],c=COLORS[i%len(COLORS)],
+                           s=28,alpha=0.75,edgecolors='none',label=f'Class {i}')
+            ax.set_title(ttl,color='#4fc3f7',fontsize=11,fontweight='bold')
+            ax.set_xlabel("PC 1",color='#8892b0'); ax.set_ylabel("PC 2",color='#8892b0')
+            ax.legend(fontsize=8,facecolor='#0d1b2a',labelcolor='#ccd6f6',edgecolor='#1e3a5f',
+                      loc='upper right')
+        plt.tight_layout(); st.pyplot(fig); plt.close()
+
+        # ── Similarity heatmap ────────────────────────────────
+        st.markdown("### 🔥 Similarity Matrix")
+        st.markdown("""<div class="card">
+<p>The heatmap below shows the cosine similarity between the embeddings of the first 30 samples.
+In a well-trained model, you should see <b>bright blocks along the diagonal</b> — samples of the same class are similar to each other.</p>
+<div class="highlight">💡 A block-diagonal pattern means the model has discovered the class structure without any labels</div>
+</div>""", unsafe_allow_html=True)
+
+        n_sim = min(30, len(X_cl))
+        # Sort by class for cleaner visualisation
+        sort_idx = np.argsort(y_cl[:n_sim])
+        emb_sorted = emb_after[sort_idx]
+        sim_mat = emb_sorted @ emb_sorted.T
+
+        fig,axes=plt.subplots(1,2,figsize=(13,5)); fig.patch.set_facecolor('#0a0f1e')
+        for ax,emb,ttl in zip(axes,
+            [emb_before[sort_idx] @ emb_before[sort_idx].T, sim_mat],
+            ['Before Training','After Training']):
+            ax.set_facecolor('#0d1b2a')
+            im=ax.imshow(emb,cmap='RdBu_r',vmin=-1,vmax=1,aspect='auto')
+            plt.colorbar(im,ax=ax,label='Cosine Similarity')
+            ax.set_title(ttl,color='#4fc3f7',fontsize=11,fontweight='bold')
+            ax.set_xlabel("Sample (sorted by class)",color='#8892b0')
+            ax.set_ylabel("Sample (sorted by class)",color='#8892b0')
+            ax.tick_params(colors='#8892b0')
+        plt.tight_layout(); st.pyplot(fig); plt.close()
+
+        # ── KNN accuracy on embeddings ────────────────────────
+        st.markdown("### 🎯 How Good are the Representations? (Linear Probe)")
+        st.markdown("""<div class="card">
+<h3>Linear Probe — The Standard Evaluation</h3>
+<p>To measure representation quality, we train a simple linear classifier (KNN with K=1)
+on top of the frozen embeddings. No fine-tuning, no extra learning — just "can a straight line separate the clusters?"</p>
+<p>If the representations are good, even a simple classifier will perform well.
+This is called a <b>linear probe</b> or <b>linear evaluation</b>.</p>
+<div class="highlight">💡 Good rule of thumb: if linear probe accuracy >> random (1/n_classes), the model has learned something useful</div>
+</div>""", unsafe_allow_html=True)
+
+        from sklearn.neighbors import KNeighborsClassifier as KNN_
+        from sklearn.model_selection import cross_val_score
+        random_baseline = 1.0/n_cls_cl
+        try:
+            acc_before = cross_val_score(KNN_(n_neighbors=5),emb_before,y_cl,cv=3).mean()
+            acc_after  = cross_val_score(KNN_(n_neighbors=5),emb_after, y_cl,cv=3).mean()
+        except:
+            acc_before = acc_after = 0.0
+
+        pb1,pb2,pb3=st.columns(3)
+        for col,lbl,val,clr in zip([pb1,pb2,pb3],
+            ["🎲 Random Baseline","📊 Before Training (KNN-5)","✅ After Training (KNN-5)"],
+            [f"{random_baseline:.1%}",f"{acc_before:.1%}",f"{acc_after:.1%}"],
+            ['#8892b0','#ffa726','#00e5ff']):
+            with col:
+                st.markdown(f'<div class="metric-box"><div class="value" style="color:{clr};">{val}</div><div class="label">{lbl}</div></div>',unsafe_allow_html=True)
+
+    # ─────────────────────────────────────────────────────────
 # ── Footer ───────────────────────────────────────────────────
 st.markdown("---")
 st.markdown("""
 <div style="text-align:center;color:#8892b0;font-family:'JetBrains Mono',monospace;font-size:0.75rem;padding:0.4rem 0;">
-    ML Explorer &nbsp;·&nbsp; SVM · Regression · Decision Tree · K-Means · KNN · MLP · AutoEncoder · VAE &nbsp;·&nbsp; 🤖
+    ML Explorer &nbsp;·&nbsp; SVM · Regression · Decision Tree · K-Means · KNN · MLP · AutoEncoder · VAE · Contrastive &nbsp;·&nbsp; 🤖
 </div>
 """, unsafe_allow_html=True)
