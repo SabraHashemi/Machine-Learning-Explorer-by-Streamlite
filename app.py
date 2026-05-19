@@ -222,7 +222,7 @@ with st.sidebar:
         ["⚡ SVM", "📈 Regression", "🌳 Decision Tree / RF",
          "🔵 K-Means Clustering", "👥 KNN", "🧠 Neural Network (MLP)",
          "🔁 AutoEncoder", "🎲 VAE (Variational)", "🔗 Contrastive Learning",
-         "🎯 Uncertainty Estimation"],
+         "🎯 Uncertainty Estimation", "🎒 Bag of Features"],
         label_visibility="collapsed"
     )
     st.markdown("---")
@@ -3415,10 +3415,666 @@ A good method should show <b>clear separation</b> between ID (blue) and OOD (red
 </div>""", unsafe_allow_html=True)
 
 
+
+elif algo == "🎒 Bag of Features":
+    st.markdown("""
+<div class="main-header">
+<h1>🎒 Bag of Features (Bag of Visual Words)</h1>
+<p>The bridge between classical computer vision and deep learning — represent images as histograms of visual words</p>
+</div>""", unsafe_allow_html=True)
+
+    # ═══════════════════════════════════════════════════════════
+    # SIDEBAR
+    # ═══════════════════════════════════════════════════════════
+    with st.sidebar:
+        st.markdown("### ⚙️ BoF Settings")
+
+        st.markdown("""<div style="color:#8892b0;font-size:0.75rem;margin-bottom:3px;">
+        📖 <b>Vocabulary Size (K)</b><br>
+        Number of "visual words" in the codebook — i.e., number of K-Means clusters.<br>
+        • <b>Small K (8–16)</b>: coarse vocabulary, fast but less discriminative<br>
+        • <b>Large K (64–256)</b>: rich vocabulary, more precise but needs more data<br>
+        • Think of it like a dictionary: more words = more expressive descriptions<br>
+        • Standard values in literature: 256–4096 for real images</div>""", unsafe_allow_html=True)
+        vocab_size = st.slider("Vocabulary Size (K)", 4, 64, 16, 4, key="bof_k")
+
+        st.markdown("""<div style="color:#8892b0;font-size:0.75rem;margin:8px 0 3px;">
+        🔲 <b>Patch Size</b><br>
+        Size of local image patches to extract as feature descriptors.<br>
+        • <b>Small patches (2×2)</b>: fine texture details, many patches per image<br>
+        • <b>Large patches (6×6)</b>: coarser structure, fewer patches, more global<br>
+        • In real BoF: SIFT descriptors use 16×16 patches. Here we use flattened patches.</div>""", unsafe_allow_html=True)
+        patch_size = st.slider("Patch Size (pixels)", 2, 6, 4, 1, key="bof_ps")
+
+        st.markdown("""<div style="color:#8892b0;font-size:0.75rem;margin:8px 0 3px;">
+        📐 <b>Patch Stride</b><br>
+        How many pixels to move between patch extractions (dense sampling).<br>
+        • <b>Stride = 1</b>: overlapping patches, very thorough but slow<br>
+        • <b>Stride = patch_size</b>: non-overlapping, faster<br>
+        • Smaller stride = more patches per image = richer representation</div>""", unsafe_allow_html=True)
+        stride = st.slider("Patch Stride", 1, 6, 2, 1, key="bof_stride")
+
+        st.markdown("""<div style="color:#8892b0;font-size:0.75rem;margin:8px 0 3px;">
+        🎯 <b>Classifier</b><br>
+        Model trained on top of BoF histograms.<br>
+        • <b>SVM</b>: historically paired with BoF — excellent results in 2000s<br>
+        • <b>KNN</b>: simple baseline, histogram similarity<br>
+        • <b>Random Forest</b>: handles feature interactions well</div>""", unsafe_allow_html=True)
+        bof_clf_name = st.selectbox("Classifier", ["SVM (RBF)", "KNN", "Random Forest"], key="bof_clf")
+
+        st.markdown("""<div style="color:#8892b0;font-size:0.75rem;margin:8px 0 3px;">
+        📊 <b>Normalization</b><br>
+        How to normalize the histogram before classification.<br>
+        • <b>L1 (sum=1)</b>: relative frequency — most common, makes histograms comparable<br>
+        • <b>L2 (unit norm)</b>: better for SVM with RBF kernel<br>
+        • <b>None</b>: raw counts — sensitive to image size differences</div>""", unsafe_allow_html=True)
+        hist_norm = st.selectbox("Histogram Normalization", ["L1", "L2", "None"], key="bof_norm")
+
+        st.markdown("---")
+        st.markdown("### 📊 Dataset")
+        bof_ds = st.selectbox("Dataset", ["Digits (MNIST-like)", "Fashion (simulated)"], key="bof_ds")
+
+    # ═══════════════════════════════════════════════════════════
+    # DATA
+    # ═══════════════════════════════════════════════════════════
+    @st.cache_data
+    def get_bof_data(name, seed=42):
+        if name == "Digits (MNIST-like)":
+            d = datasets.load_digits()
+            # digits are 8×8 images
+            X_img = d.images.astype(np.float32) / 16.0   # (N, 8, 8)
+            y     = d.target
+            class_names = [str(i) for i in range(10)]
+        else:
+            # Simulate fashion-like dataset: 3 classes with different texture patterns
+            np.random.seed(seed)
+            N = 300; sz = 8
+            imgs, labels = [], []
+            for cls in range(3):
+                for _ in range(N//3):
+                    img = np.random.randn(sz, sz).astype(np.float32) * 0.3
+                    if cls == 0:    # horizontal stripes
+                        for r in range(0, sz, 2): img[r, :] += 1.0
+                    elif cls == 1:  # vertical stripes
+                        for c in range(0, sz, 2): img[:, c] += 1.0
+                    else:           # checkerboard
+                        for r in range(sz):
+                            for c in range(sz):
+                                if (r+c) % 2 == 0: img[r,c] += 1.0
+                    img = np.clip(img, 0, 1)
+                    imgs.append(img); labels.append(cls)
+            X_img = np.array(imgs)
+            y     = np.array(labels)
+            class_names = ["Horizontal", "Vertical", "Checkerboard"]
+        return X_img, y, class_names
+
+    X_img, y_bof, class_names = get_bof_data(bof_ds)
+    n_cls_bof = len(np.unique(y_bof))
+    img_h, img_w = X_img.shape[1], X_img.shape[2]
+
+    # ═══════════════════════════════════════════════════════════
+    # BOF PIPELINE
+    # ═══════════════════════════════════════════════════════════
+    def extract_patches(img, patch_sz, stride_sz):
+        """Extract dense local patches from a 2D image."""
+        patches = []
+        for r in range(0, img.shape[0]-patch_sz+1, stride_sz):
+            for c in range(0, img.shape[1]-patch_sz+1, stride_sz):
+                patch = img[r:r+patch_sz, c:c+patch_sz].ravel()
+                patches.append(patch)
+        return np.array(patches, dtype=np.float32) if patches else np.zeros((1, patch_sz*patch_sz))
+
+    def build_vocabulary(X_images, patch_sz, stride_sz, vocab_sz, seed=42):
+        """Step 1 & 2: Extract all patches, cluster them into visual words (K-Means)."""
+        all_patches = []
+        for img in X_images:
+            patches = extract_patches(img, patch_sz, stride_sz)
+            all_patches.append(patches)
+        all_patches = np.vstack(all_patches)
+        # Subsample if too many
+        if len(all_patches) > 5000:
+            idx = np.random.RandomState(seed).choice(len(all_patches), 5000, replace=False)
+            all_patches = all_patches[idx]
+        km = KMeans(n_clusters=vocab_sz, random_state=seed, n_init=5, max_iter=100)
+        km.fit(all_patches)
+        return km, all_patches
+
+    def image_to_histogram(img, km, patch_sz, stride_sz, vocab_sz, norm):
+        """Step 3 & 4: Assign each patch to nearest visual word, build histogram."""
+        patches = extract_patches(img, patch_sz, stride_sz)
+        assignments = km.predict(patches)
+        hist, _ = np.histogram(assignments, bins=np.arange(vocab_sz+1))
+        hist = hist.astype(np.float32)
+        if norm == "L1":
+            s = hist.sum(); hist = hist / (s + 1e-8)
+        elif norm == "L2":
+            n = np.linalg.norm(hist); hist = hist / (n + 1e-8)
+        return hist
+
+    def dataset_to_histograms(X_images, km, patch_sz, stride_sz, vocab_sz, norm):
+        """Convert all images to BoF histograms."""
+        return np.array([image_to_histogram(img, km, patch_sz, stride_sz, vocab_sz, norm)
+                         for img in X_images])
+
+    # ── Train ─────────────────────────────────────────────────
+    with st.spinner("Building vocabulary (K-Means on patches)..."):
+        Xtr_img, Xte_img, ytr_b, yte_b = train_test_split(
+            X_img, y_bof, test_size=0.25, random_state=42, stratify=y_bof)
+        km_vocab, all_patches = build_vocabulary(Xtr_img, patch_size, stride, vocab_size)
+
+    with st.spinner("Encoding images as histograms..."):
+        Xtr_hist = dataset_to_histograms(Xtr_img, km_vocab, patch_size, stride, vocab_size, hist_norm)
+        Xte_hist = dataset_to_histograms(Xte_img, km_vocab, patch_size, stride, vocab_size, hist_norm)
+
+    # ── Classifier ────────────────────────────────────────────
+    if bof_clf_name == "SVM (RBF)":
+        clf_bof = svm.SVC(kernel='rbf', C=10, probability=True, random_state=42)
+    elif bof_clf_name == "KNN":
+        clf_bof = KNeighborsClassifier(n_neighbors=5)
+    else:
+        clf_bof = RandomForestClassifier(n_estimators=100, random_state=42)
+
+    clf_bof.fit(Xtr_hist, ytr_b)
+    yte_pred_b = clf_bof.predict(Xte_hist)
+    bof_acc = accuracy_score(yte_b, yte_pred_b)
+
+    # Baseline: raw pixel SVM
+    from sklearn.preprocessing import normalize as sk_normalize
+    Xtr_raw = Xtr_img.reshape(len(Xtr_img), -1).astype(np.float32)
+    Xte_raw = Xte_img.reshape(len(Xte_img), -1).astype(np.float32)
+    clf_raw = svm.SVC(kernel='rbf', C=10, probability=True, random_state=42)
+    clf_raw.fit(Xtr_raw, ytr_b)
+    raw_acc = accuracy_score(yte_b, clf_raw.predict(Xte_raw))
+
+    # Patches per image
+    n_patches_per_img = len(extract_patches(Xtr_img[0], patch_size, stride))
+
+    # ═══════════════════════════════════════════════════════════
+    # TABS
+    # ═══════════════════════════════════════════════════════════
+    tab1,tab2,tab3,tab4,tab5 = st.tabs([
+        "📖 Concept & History",
+        "🔍 Step-by-Step Pipeline",
+        "📚 Visual Vocabulary",
+        "📊 Classification Results",
+        "🔗 BoF vs Deep Learning"
+    ])
+
+    # ─────────────────────────────────────────────────────────
+    # TAB 1 — Concept & History
+    # ─────────────────────────────────────────────────────────
+    with tab1:
+        st.markdown("## What is Bag of Features?")
+
+        c1,c2 = st.columns([1,1])
+        with c1:
+            st.markdown("""
+<div class="card">
+<h3>📜 The History — From Text to Images</h3>
+<p>Bag of Features (BoF) was inspired directly by <b>Bag of Words (BoW)</b> in Natural Language Processing.</p>
+<p>In NLP, a document is represented as a histogram of word frequencies — ignoring word order but capturing topic. "The cat sat on the mat" → {"cat":1, "sat":1, "mat":1, ...}</p>
+<p>Sivic & Zisserman (2003) and Csurka et al. (2004) asked: <b>"Can we do the same for images?"</b></p>
+<p>The answer: yes! Replace "words" with "visual words" — clusters of similar local image patches.</p>
+<div class="highlight">💡 BoF dominated computer vision from 2004–2012, before deep learning took over at ImageNet 2012</div>
+</div>
+
+<div class="card">
+<h3>🗓️ The Golden Era of BoF (2004–2012)</h3>
+<ul>
+<li><b>2004</b>: Csurka et al. introduce visual vocabulary + SVM for image classification</li>
+<li><b>2005</b>: SIFT descriptor (Lowe) becomes the standard local feature</li>
+<li><b>2006</b>: Spatial Pyramid Matching (Lazebnik) — adds location information</li>
+<li><b>2007</b>: Fisher Vectors — richer encoding than histograms</li>
+<li><b>2011</b>: VLAD (Vector of Locally Aggregated Descriptors) — compact alternative</li>
+<li><b>2012</b>: AlexNet wins ImageNet — deep features completely replace BoF</li>
+</ul>
+<div class="highlight">💡 But BoF concepts live on: CNN features are essentially learned visual words!</div>
+</div>
+
+<div class="card">
+<h3>🧩 The Core Analogy: Text vs Image</h3>
+<table style="width:100%;font-size:0.85rem;color:#a8b2d8;border-collapse:collapse;">
+<tr>
+<th style="color:#4fc3f7;text-align:left;padding:6px 8px;border-bottom:1px solid #1e3a5f;">NLP (Bag of Words)</th>
+<th style="color:#4fc3f7;text-align:left;padding:6px 8px;border-bottom:1px solid #1e3a5f;">CV (Bag of Features)</th>
+</tr>
+<tr style="border-bottom:1px solid #1e3a5f30;">
+<td style="padding:5px 8px;">Word</td><td style="padding:5px 8px;">Local image patch / descriptor</td>
+</tr>
+<tr style="border-bottom:1px solid #1e3a5f30;">
+<td style="padding:5px 8px;">Vocabulary</td><td style="padding:5px 8px;">Codebook (K-Means cluster centres)</td>
+</tr>
+<tr style="border-bottom:1px solid #1e3a5f30;">
+<td style="padding:5px 8px;">Word frequency</td><td style="padding:5px 8px;">Visual word frequency (histogram)</td>
+</tr>
+<tr style="border-bottom:1px solid #1e3a5f30;">
+<td style="padding:5px 8px;">TF-IDF weighting</td><td style="padding:5px 8px;">Soft assignment / Fisher vectors</td>
+</tr>
+<tr>
+<td style="padding:5px 8px;">Document classifier</td><td style="padding:5px 8px;">SVM on histograms</td>
+</tr>
+</table>
+</div>
+
+<div class="card">
+<h3>⚠️ Key Limitation: Bag = No Spatial Information</h3>
+<p>The name says it all — it's a <b>bag</b>. The histogram doesn't care about <em>where</em> visual words appear, only <em>how often</em>.</p>
+<p>A face with eyes at the bottom and mouth at the top produces the <b>same histogram</b> as a normal face.</p>
+<p>Solutions developed to fix this:</p>
+<ul>
+<li><b>Spatial Pyramid Matching</b>: divide image into grids, build histograms for each cell</li>
+<li><b>Part-based models</b>: explicitly model relative positions of parts</li>
+<li><b>CNNs</b>: preserve spatial structure through convolutional layers</li>
+</ul>
+<div class="highlight">💡 This spatial blindness was the biggest weakness — CNNs solve it naturally</div>
+</div>
+""", unsafe_allow_html=True)
+
+        with c2:
+            # Pipeline overview diagram
+            fig,ax = plt.subplots(figsize=(7,9))
+            fig.patch.set_facecolor('#0a0f1e'); ax.set_facecolor('#0a0f1e'); ax.axis('off')
+
+            steps = [
+                (0.82, '#0d2b45', '#4fc3f7',  '① Raw Image\n(8×8 pixels)'),
+                (0.66, '#0d2b45', '#66bb6a',  '② Extract Local Patches\n(dense sampling)'),
+                (0.50, '#1a0d30', '#ab47bc',  '③ Describe Patches\n(pixel values / SIFT / HOG)'),
+                (0.34, '#1a0d30', '#ffa726',  '④ Build Vocabulary\n(K-Means on all patches)'),
+                (0.18, '#0d2b45', '#00e5ff',  '⑤ Encode Image\n(histogram of visual words)'),
+                (0.03, '#0d1b2a', '#ef5350',  '⑥ Classify\n(SVM / KNN / RF on histograms)'),
+            ]
+            for y_pos, fc, ec, lbl in steps:
+                ax.add_patch(plt.Rectangle((0.1, y_pos), 0.8, 0.12,
+                             fc=fc, ec=ec, lw=2, zorder=3, alpha=0.9))
+                ax.text(0.5, y_pos+0.06, lbl, ha='center', va='center',
+                        color='white', fontsize=9, fontfamily='monospace',
+                        fontweight='bold', zorder=5)
+                if y_pos > 0.03:
+                    ax.annotate('', xy=(0.5, y_pos), xytext=(0.5, y_pos+0.12),
+                                arrowprops=dict(arrowstyle='->', color=ec, lw=2), zorder=6)
+
+            ax.set_xlim(0,1); ax.set_ylim(-0.02, 1.0)
+            ax.set_title('Bag of Features Pipeline', color='#4fc3f7',
+                         fontsize=13, fontweight='bold', pad=10)
+            st.pyplot(fig); plt.close()
+
+    # ─────────────────────────────────────────────────────────
+    # TAB 2 — Step by Step
+    # ─────────────────────────────────────────────────────────
+    with tab2:
+        st.markdown("## 🔍 Step-by-Step: Building a BoF Representation")
+
+        # STEP 1: Show sample images
+        st.markdown("### Step 1 — The Raw Images")
+        st.markdown("""<div class="card">
+<p>We start with raw pixel images. The model doesn't receive raw pixels directly — instead, we extract local patches from each image and describe them with a feature vector.</p>
+<p>For real images, descriptors like <b>SIFT</b> (Scale-Invariant Feature Transform) or <b>HOG</b> (Histogram of Oriented Gradients) are used. They're designed to be robust to lighting, scale, and rotation changes. Here we use raw pixel values of patches as a simple descriptor.</p>
+</div>""", unsafe_allow_html=True)
+
+        np.random.seed(10)
+        show_idx = [np.where(y_bof==c)[0][0] for c in range(n_cls_bof)]
+        fig,axes=plt.subplots(1, n_cls_bof, figsize=(n_cls_bof*2.5, 2.8))
+        fig.patch.set_facecolor('#0a0f1e')
+        if n_cls_bof == 1: axes = [axes]
+        for ax,idx,cn in zip(axes, show_idx, class_names):
+            ax.imshow(X_img[idx], cmap='Blues', vmin=0, vmax=1)
+            ax.set_title(f'Class: {cn}', color='#4fc3f7', fontsize=9, fontweight='bold')
+            ax.axis('off')
+        fig.suptitle('Sample Images (one per class)', color='#4fc3f7',
+                     fontsize=11, fontweight='bold')
+        plt.tight_layout(); st.pyplot(fig); plt.close()
+
+        # STEP 2: Dense patch extraction
+        st.markdown("### Step 2 — Dense Patch Extraction")
+        st.markdown(f"""<div class="card">
+<p>We slide a <b>{patch_size}×{patch_size} window</b> across each image with a stride of {stride} pixel(s), extracting overlapping patches.
+Each patch is flattened to a vector of {patch_size*patch_size} numbers — this is the "descriptor" for that location.</p>
+<p>For the <b>{img_h}×{img_w}</b> images in this dataset, each image yields approximately <b>{n_patches_per_img} patches</b>.</p>
+<p>In real BoF pipelines, patch extraction can be:</p>
+<ul>
+<li><b>Dense sampling</b> (what we do): extract patches at every location on a grid</li>
+<li><b>Interest point detection</b>: only extract patches at salient keypoints (corners, blobs) detected by SIFT or SURF. Fewer patches but each is more informative.</li>
+</ul>
+</div>""", unsafe_allow_html=True)
+
+        # Visualise patches on one image
+        demo_img = Xtr_img[0]
+        demo_patches = extract_patches(demo_img, patch_size, stride)
+        fig,axes=plt.subplots(1,2,figsize=(10,4))
+        fig.patch.set_facecolor('#0a0f1e')
+        for ax in axes: style_ax(ax)
+
+        axes[0].imshow(demo_img, cmap='Blues', vmin=0, vmax=1, interpolation='nearest')
+        # Draw patch grid
+        for r in range(0, img_h-patch_size+1, stride):
+            for c in range(0, img_w-patch_size+1, stride):
+                rect = plt.Rectangle((c-0.5, r-0.5), patch_size, patch_size,
+                                     fill=False, ec='#00e5ff', lw=0.8, alpha=0.6)
+                axes[0].add_patch(rect)
+        axes[0].set_title(f'Dense patch extraction\n({n_patches_per_img} patches, {patch_size}×{patch_size}, stride={stride})',
+                          color='#4fc3f7', fontsize=10, fontweight='bold')
+        axes[0].axis('off')
+
+        # Show first 12 patches as images
+        n_show_p = min(12, len(demo_patches))
+        grid_cols = 6; grid_rows = (n_show_p+grid_cols-1)//grid_cols
+        patch_grid = np.ones((grid_rows*(patch_size+1), grid_cols*(patch_size+1))) * 0.5
+        for i in range(n_show_p):
+            r = i//grid_cols; c = i%grid_cols
+            patch_grid[r*(patch_size+1):r*(patch_size+1)+patch_size,
+                       c*(patch_size+1):c*(patch_size+1)+patch_size] = \
+                demo_patches[i].reshape(patch_size, patch_size)
+        axes[1].imshow(patch_grid, cmap='Blues', vmin=0, vmax=1, interpolation='nearest')
+        axes[1].set_title(f'First {n_show_p} extracted patches\n(each = {patch_size*patch_size}-dim vector)',
+                          color='#4fc3f7', fontsize=10, fontweight='bold')
+        axes[1].axis('off')
+        plt.tight_layout(); st.pyplot(fig); plt.close()
+
+        # STEP 3: K-Means vocabulary
+        st.markdown("### Step 3 — Building the Visual Vocabulary (K-Means)")
+        st.markdown(f"""<div class="card">
+<p>All patches from all training images are pooled together ({len(all_patches):,} total patches).
+K-Means clusters them into <b>K={vocab_size} visual words</b>.</p>
+<p>Each cluster centre is a "prototypical" local patch — the centroid represents a common visual pattern that appears across images.
+These K centroids form the <b>codebook</b> or <b>visual vocabulary</b>.</p>
+<p>Think of it as: "what are the K most common texture patterns in this dataset?"</p>
+<ul>
+<li>Soft textures → smooth gradient centroids</li>
+<li>Edges → edge-like centroids</li>
+<li>Corners → corner-like centroids</li>
+</ul>
+</div>""", unsafe_allow_html=True)
+
+        # Step 4: Encoding
+        st.markdown("### Step 4 — Encoding: Image → Histogram")
+        st.markdown(f"""<div class="card">
+<p>For each image, we take its patches and assign each one to its <b>nearest visual word</b> (nearest K-Means centroid in descriptor space).
+Count how many patches assigned to each word → <b>histogram of length K={vocab_size}</b>.</p>
+<p>This histogram is the BoF representation of the image — a fixed-length vector regardless of image size, capturing "what visual patterns appear and how often".</p>
+<p>Current normalization: <b>{hist_norm}</b> — {'divides by total count (relative frequencies)' if hist_norm=='L1' else 'divides by L2 norm (unit vector)' if hist_norm=='L2' else 'raw counts'}</p>
+</div>""", unsafe_allow_html=True)
+
+        # Show histogram for 3 images (one per class)
+        fig,axes=plt.subplots(1, n_cls_bof, figsize=(13, 3.5))
+        fig.patch.set_facecolor('#0a0f1e')
+        if n_cls_bof == 1: axes=[axes]
+        for ax,(idx,cn) in zip(axes, zip(show_idx, class_names)):
+            hist_i = image_to_histogram(X_img[idx], km_vocab, patch_size, stride, vocab_size, hist_norm)
+            ax.bar(range(vocab_size), hist_i, color='#4fc3f7', alpha=0.85, width=0.8)
+            ax.set_title(f'BoF Histogram\nClass: {cn}', color='#4fc3f7', fontsize=9, fontweight='bold')
+            ax.set_xlabel('Visual Word Index', color='#8892b0', fontsize=8)
+            ax.set_ylabel('Frequency', color='#8892b0', fontsize=8)
+            style_ax(ax)
+        fig.suptitle(f'BoF Histograms (K={vocab_size}, {hist_norm} norm)',
+                     color='#4fc3f7', fontsize=11, fontweight='bold')
+        plt.tight_layout(); st.pyplot(fig); plt.close()
+
+        st.markdown(f"""<div class="card">
+<p>Different classes should produce <b>different histogram shapes</b> — that's what makes BoF discriminative.
+The classifier (here: {bof_clf_name}) then learns to distinguish these histogram patterns.</p>
+<div class="highlight">💡 If all histograms look the same, increase vocabulary size K or try better descriptors</div>
+</div>""", unsafe_allow_html=True)
+
+    # ─────────────────────────────────────────────────────────
+    # TAB 3 — Visual Vocabulary
+    # ─────────────────────────────────────────────────────────
+    with tab3:
+        st.markdown("## 📚 Visual Vocabulary Explorer")
+        st.markdown(f"""<div class="card">
+<h3>🔍 The {vocab_size} Visual Words (K-Means Centroids)</h3>
+<p>Each tile below is one "visual word" — the centre of a K-Means cluster in patch space.
+It represents a <b>prototypical local patch</b> that commonly appears in the training images.</p>
+<p>In real BoF with SIFT: visual words look like oriented edges, blobs, corners.
+With raw patches on our small {img_h}×{img_w} images, they capture basic texture patterns.</p>
+</div>""", unsafe_allow_html=True)
+
+        centroids = km_vocab.cluster_centers_   # (K, patch_size*patch_size)
+        cols_v = min(16, vocab_size)
+        rows_v = (vocab_size + cols_v - 1) // cols_v
+        grid_v = np.ones((rows_v*(patch_size+2), cols_v*(patch_size+2))) * 0.5
+        for i,c in enumerate(centroids):
+            r_g = i // cols_v; c_g = i % cols_v
+            tile = c.reshape(patch_size, patch_size)
+            tile = (tile - tile.min()) / (tile.max() - tile.min() + 1e-8)
+            grid_v[r_g*(patch_size+2):r_g*(patch_size+2)+patch_size,
+                   c_g*(patch_size+2):c_g*(patch_size+2)+patch_size] = tile
+
+        fig,ax=plt.subplots(figsize=(min(12, cols_v*1.2), rows_v*1.2+0.5))
+        fig.patch.set_facecolor('#0a0f1e'); ax.set_facecolor('#0d1b2a')
+        ax.imshow(grid_v, cmap='Blues', vmin=0, vmax=1, interpolation='nearest')
+        ax.set_title(f'All {vocab_size} Visual Words (K-Means centroids on {patch_size}×{patch_size} patches)',
+                     color='#4fc3f7', fontsize=11, fontweight='bold')
+        ax.axis('off')
+        plt.tight_layout(); st.pyplot(fig); plt.close()
+
+        # Cluster size distribution
+        st.markdown("### 📊 Visual Word Usage Distribution")
+        st.markdown("""<div class="card">
+<p>How often does each visual word get used across training images?
+An ideal vocabulary has words that are <b>balanced in frequency</b> — if some words are used 100× more than others, those words dominate the histogram and the vocabulary is poorly balanced.</p>
+<p>In practice, some words are always more common (like flat/smooth texture words) — this is expected.</p>
+<div class="highlight">💡 If one word dominates (used in 80%+ of patches), your vocabulary may be too small or the data too homogeneous</div>
+</div>""", unsafe_allow_html=True)
+
+        all_assignments = km_vocab.predict(all_patches)
+        word_counts, _ = np.histogram(all_assignments, bins=np.arange(vocab_size+1))
+
+        fig,axes=plt.subplots(1,2,figsize=(13,4))
+        fig.patch.set_facecolor('#0a0f1e')
+        for ax in axes: style_ax(ax)
+
+        axes[0].bar(range(vocab_size), word_counts, color='#4fc3f7', alpha=0.85, width=0.8)
+        axes[0].set_xlabel('Visual Word Index', color='#8892b0')
+        axes[0].set_ylabel('Patch Count', color='#8892b0')
+        axes[0].set_title('Visual Word Usage Frequency', color='#4fc3f7',
+                          fontsize=11, fontweight='bold')
+
+        axes[1].hist(word_counts, bins=15, color='#ab47bc', alpha=0.85, edgecolor='#0a0f1e')
+        axes[1].axvline(word_counts.mean(), color='#00e5ff', lw=2, ls='--',
+                        label=f'Mean = {word_counts.mean():.0f}')
+        axes[1].set_xlabel('Usage Count', color='#8892b0')
+        axes[1].set_ylabel('Number of Words', color='#8892b0')
+        axes[1].set_title('Distribution of Word Frequencies', color='#4fc3f7',
+                          fontsize=11, fontweight='bold')
+        axes[1].legend(fontsize=9, facecolor='#0d1b2a', labelcolor='#ccd6f6', edgecolor='#1e3a5f')
+
+        plt.tight_layout(); st.pyplot(fig); plt.close()
+
+        # Show most and least used words
+        sorted_words = np.argsort(word_counts)
+        st.markdown("### 🏆 Most and Least Used Visual Words")
+        c1,c2 = st.columns(2)
+        with c1:
+            st.markdown('<div class="card"><h3>🔝 Top 6 Most Used Words</h3></div>', unsafe_allow_html=True)
+            top_idx = sorted_words[-6:][::-1]
+            fig,axes=plt.subplots(1,6,figsize=(9,1.8))
+            fig.patch.set_facecolor('#0a0f1e')
+            for ax,wi in zip(axes,top_idx):
+                tile=centroids[wi].reshape(patch_size,patch_size)
+                tile=(tile-tile.min())/(tile.max()-tile.min()+1e-8)
+                ax.imshow(tile,cmap='Blues',vmin=0,vmax=1,interpolation='nearest')
+                ax.set_title(f'#{wi}\n{word_counts[wi]}',color='#4fc3f7',fontsize=7)
+                ax.axis('off')
+            plt.tight_layout(); st.pyplot(fig); plt.close()
+        with c2:
+            st.markdown('<div class="card"><h3>🔻 Top 6 Least Used Words</h3></div>', unsafe_allow_html=True)
+            bot_idx = sorted_words[:6]
+            fig,axes=plt.subplots(1,6,figsize=(9,1.8))
+            fig.patch.set_facecolor('#0a0f1e')
+            for ax,wi in zip(axes,bot_idx):
+                tile=centroids[wi].reshape(patch_size,patch_size)
+                tile=(tile-tile.min())/(tile.max()-tile.min()+1e-8)
+                ax.imshow(tile,cmap='Reds',vmin=0,vmax=1,interpolation='nearest')
+                ax.set_title(f'#{wi}\n{word_counts[wi]}',color='#ef5350',fontsize=7)
+                ax.axis('off')
+            plt.tight_layout(); st.pyplot(fig); plt.close()
+
+    # ─────────────────────────────────────────────────────────
+    # TAB 4 — Classification Results
+    # ─────────────────────────────────────────────────────────
+    with tab4:
+        st.markdown("## 📊 Classification Results")
+
+        m1,m2,m3,m4 = st.columns(4)
+        for col,lbl,val,clr in zip([m1,m2,m3,m4],
+            [f"🎯 BoF+{bof_clf_name.split()[0]} Acc", "📊 Raw Pixel Acc",
+             f"📖 Vocab Size K", f"🔲 Patches/Image"],
+            [f"{bof_acc:.1%}", f"{raw_acc:.1%}", str(vocab_size), str(n_patches_per_img)],
+            ['#00e5ff','#ffa726','#4fc3f7','#ab47bc']):
+            with col:
+                st.markdown(f'<div class="metric-box"><div class="value" style="color:{clr};">{val}</div><div class="label">{lbl}</div></div>',
+                            unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        c1,c2 = st.columns(2)
+        with c1:
+            # Confusion matrix
+            fig,ax=plt.subplots(figsize=(5.5,4.5))
+            style_ax(ax,fig)
+            cm_bof = confusion_matrix(yte_b, yte_pred_b)
+            sns.heatmap(cm_bof, annot=True, fmt='d', ax=ax,
+                        cmap=sns.light_palette("#4fc3f7",as_cmap=True),
+                        xticklabels=class_names[:n_cls_bof],
+                        yticklabels=class_names[:n_cls_bof],
+                        linewidths=0.5,
+                        annot_kws={"size":11,"weight":"bold","color":"#0a0f1e"})
+            ax.set_xlabel("Predicted", color='#8892b0')
+            ax.set_ylabel("Actual", color='#8892b0')
+            ax.set_title(f"BoF + {bof_clf_name} Confusion Matrix",
+                         color='#4fc3f7', fontsize=11, fontweight='bold')
+            ax.tick_params(colors='#8892b0', labelsize=8)
+            st.pyplot(fig); plt.close()
+
+        with c2:
+            # Vocab size sweep
+            st.markdown("#### Effect of Vocabulary Size K on Accuracy")
+            k_vals = [4,8,12,16,24,32,48,64]
+            k_vals = [k for k in k_vals if k <= vocab_size*4][:8]
+            accs_k = []
+            with st.spinner("Sweeping K values..."):
+                for kv in k_vals:
+                    try:
+                        km_tmp = KMeans(n_clusters=kv, random_state=42, n_init=3, max_iter=50)
+                        km_tmp.fit(all_patches)
+                        Xtr_tmp = dataset_to_histograms(Xtr_img, km_tmp, patch_size, stride, kv, hist_norm)
+                        Xte_tmp = dataset_to_histograms(Xte_img, km_tmp, patch_size, stride, kv, hist_norm)
+                        clf_tmp = svm.SVC(kernel='rbf', C=10, random_state=42)
+                        clf_tmp.fit(Xtr_tmp, ytr_b)
+                        accs_k.append(accuracy_score(yte_b, clf_tmp.predict(Xte_tmp)))
+                    except:
+                        accs_k.append(0)
+
+            fig,ax=plt.subplots(figsize=(5.5,4))
+            style_ax(ax,fig)
+            ax.plot(k_vals, accs_k, 'o-', color='#4fc3f7', lw=2.5, markersize=8)
+            ax.axvline(vocab_size, color='#00e5ff', lw=2, ls='--', alpha=0.8,
+                       label=f'Current K={vocab_size}')
+            ax.axhline(raw_acc, color='#ffa726', lw=1.5, ls='--', alpha=0.7,
+                       label=f'Raw pixels={raw_acc:.1%}')
+            ax.set_xlabel("Vocabulary Size K", color='#8892b0')
+            ax.set_ylabel("Test Accuracy", color='#8892b0')
+            ax.set_title("Accuracy vs Vocabulary Size\n(SVM+RBF)", color='#4fc3f7',
+                         fontsize=10, fontweight='bold')
+            ax.legend(fontsize=8, facecolor='#0d1b2a', labelcolor='#ccd6f6', edgecolor='#1e3a5f')
+            ax.set_ylim(0,1.05)
+            plt.tight_layout(); st.pyplot(fig); plt.close()
+
+        st.markdown("### 📋 Full Classification Report")
+        st.dataframe(
+            pd.DataFrame(classification_report(yte_b, yte_pred_b,
+                         target_names=class_names[:n_cls_bof], output_dict=True)).T.round(3),
+            use_container_width=True)
+
+    # ─────────────────────────────────────────────────────────
+    # TAB 5 — BoF vs Deep Learning
+    # ─────────────────────────────────────────────────────────
+    with tab5:
+        st.markdown("## 🔗 Bag of Features vs Deep Learning")
+
+        st.markdown("""
+<div class="card">
+<h3>🤝 More Similar Than You Think</h3>
+<p>Deep learning didn't replace BoF — it <b>learned to do BoF automatically and much better</b>.
+Understanding this connection gives deep insight into why CNNs work.</p>
+</div>
+
+<div class="card">
+<h3>🔁 The Deep Learning Connection</h3>
+<table style="width:100%;font-size:0.85rem;color:#a8b2d8;border-collapse:collapse;">
+<tr>
+<th style="color:#4fc3f7;text-align:left;padding:6px 8px;border-bottom:1px solid #1e3a5f;">Bag of Features</th>
+<th style="color:#4fc3f7;text-align:left;padding:6px 8px;border-bottom:1px solid #1e3a5f;">Convolutional Neural Network</th>
+</tr>
+<tr style="border-bottom:1px solid #1e3a5f30;">
+<td style="padding:5px 8px;">Hand-crafted SIFT descriptor</td>
+<td style="padding:5px 8px;">Learned conv filters (also local patches!)</td>
+</tr>
+<tr style="border-bottom:1px solid #1e3a5f30;">
+<td style="padding:5px 8px;">K-Means cluster centres</td>
+<td style="padding:5px 8px;">Learned filter bank / feature detectors</td>
+</tr>
+<tr style="border-bottom:1px solid #1e3a5f30;">
+<td style="padding:5px 8px;">Hard assignment to nearest word</td>
+<td style="padding:5px 8px;">Soft activation (ReLU) — can fire partially</td>
+</tr>
+<tr style="border-bottom:1px solid #1e3a5f30;">
+<td style="padding:5px 8px;">Global average pooling (histogram)</td>
+<td style="padding:5px 8px;">Global Average Pooling layer in modern CNNs</td>
+</tr>
+<tr style="border-bottom:1px solid #1e3a5f30;">
+<td style="padding:5px 8px;">Fixed vocabulary (K-Means offline)</td>
+<td style="padding:5px 8px;">Learned vocabulary (end-to-end gradient)</td>
+</tr>
+<tr>
+<td style="padding:5px 8px;">SVM on histogram</td>
+<td style="padding:5px 8px;">Fully connected layer on feature map</td>
+</tr>
+</table>
+<div class="highlight">💡 A CNN is essentially: learned descriptors + learned vocabulary + learned classifier — all in one end-to-end system</div>
+</div>
+
+<div class="card">
+<h3>📈 Why Deep Learning Won (ImageNet 2012)</h3>
+<ul>
+<li><b>End-to-end learning</b>: CNN optimises the descriptor, vocabulary, AND classifier jointly for the task. BoF optimises them separately — a suboptimal pipeline.</li>
+<li><b>Hierarchical features</b>: CNNs learn features at multiple scales (edges → textures → parts → objects). BoF has only one level.</li>
+<li><b>Spatial structure preserved</b>: CNNs maintain spatial relationships between features. BoF discards position.</li>
+<li><b>Data efficiency</b>: with enough data, learned features > hand-crafted ones. With data augmentation, CNNs generalise better.</li>
+</ul>
+<div class="highlight">💡 On small datasets with limited data, BoF + SVM can still compete with or beat small CNNs!</div>
+</div>
+
+<div class="card">
+<h3>🚀 Modern Extensions of BoF Ideas</h3>
+<ul>
+<li><b>Fisher Vectors</b>: instead of hard assignment to nearest word, encode the gradient of a GMM with respect to its parameters. Much richer representation.</li>
+<li><b>VLAD</b> (Vector of Locally Aggregated Descriptors): store the residuals (patch - centroid) instead of just counts. More compact than Fisher vectors.</li>
+<li><b>Spatial Pyramid Matching</b>: compute BoF histograms for image subregions at multiple scales, concatenate. Adds spatial information.</li>
+<li><b>Visual Transformer tokens</b>: in Vision Transformers (ViT), image patches are treated as "tokens" — exactly the Bag of Features idea, but with learned self-attention instead of K-Means!</li>
+</ul>
+<div class="highlight">💡 Vision Transformers (ViT, 2020) are essentially Bag of Patches + self-attention. The BoF DNA is still there!</div>
+</div>
+
+<div class="card">
+<h3>📊 When to Still Use BoF (or BoF-Inspired Methods)</h3>
+<ul>
+<li>✅ <b>Small datasets</b> (hundreds of images): CNNs overfit, BoF+SVM generalises better</li>
+<li>✅ <b>Interpretability</b>: you can visualise exactly which visual words fired for each prediction</li>
+<li>✅ <b>No GPU</b>: BoF runs on CPU efficiently</li>
+<li>✅ <b>Feature engineering insight</b>: understanding BoF helps you design better CNN architectures</li>
+<li>✅ <b>Medical/scientific imaging</b>: texture descriptors (LBP, BoF) remain competitive when training data is scarce</li>
+<li>❌ <b>Large datasets</b>: deep learning wins decisively</li>
+<li>❌ <b>Complex natural images</b>: too much variation for a small fixed vocabulary</li>
+</ul>
+</div>
+""", unsafe_allow_html=True)
+
+
 # ── Footer ───────────────────────────────────────────────────
 st.markdown("---")
 st.markdown("""
 <div style="text-align:center;color:#8892b0;font-family:'JetBrains Mono',monospace;font-size:0.75rem;padding:0.4rem 0;">
-    ML Explorer &nbsp;·&nbsp; SVM · Regression · Decision Tree · K-Means · KNN · MLP · AutoEncoder · VAE · Contrastive · Uncertainty &nbsp;·&nbsp; 🤖
+    ML Explorer &nbsp;·&nbsp; SVM · Regression · Decision Tree · K-Means · KNN · MLP · AutoEncoder · VAE · Contrastive · Uncertainty · BoF &nbsp;·&nbsp; 🤖
 </div>
 """, unsafe_allow_html=True)
